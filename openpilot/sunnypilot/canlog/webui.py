@@ -401,10 +401,12 @@ class Handler(BaseHTTPRequestHandler):
       return self._err(404, "unknown session")
     try:
       pre, post = (max(0.0, min(60.0, float(q.get(k, 3)))) for k in ("pre", "post"))
+      settle = max(0.0, min(600.0, float(q.get("settle", 2))))
     except ValueError:
-      return self._err(400, "bad pre/post")
+      return self._err(400, "bad pre/post/settle")
     from openpilot.sunnypilot.canlog import analyze
-    _, markers, results, frames = analyze.diff_file(p, pre_s=pre, post_s=post)
+    res = analyze.analyze_file(p, pre_s=pre, post_s=post, settle_s=settle)
+    markers, results, frames = res["markers"], res["diff"], res["frames"]
     for r in results:
       r["changes"] = list(r.get("changes", []))[:60]
     w = _watch()
@@ -413,7 +415,8 @@ class Handler(BaseHTTPRequestHandler):
     except Exception:
       def dec(a: int, d: bytes) -> dict: return {}
     self._json({"session": name, "pre": pre, "post": post, "results": results, "names": {"0x%X" % k: v for k, v in w.items()},
-                "watched": watched_summary(frames, markers, w, dec, post_ns=int(post * 1e9))})
+                "watched": watched_summary(frames, markers, w, dec, post_ns=int(post * 1e9)),
+                "states": res["states"][:30], "steps": res["steps"][:30], "profile": res["profile"].summary()})
 
   def _download(self, rel: str, q: dict[str, str]) -> None:
     rel = unquote(rel)
@@ -599,7 +602,9 @@ footer{color:var(--mut);font-size:12px;padding:10px 0}
 <section id="t-res">
  <div class="card"><select id="rsess"></select>
  <div class="row" style="margin-top:8px"><input id="rpre" type="number" step="0.5" min="0" value="3" aria-label="pre seconds"><input id="rpost" type="number" step="0.5" min="0" value="3" aria-label="post seconds"><button id="rrun">Run diff</button></div>
- <div class="hint">Seconds before / after each marker.</div></div>
+ <div class="hint">Seconds before / after each marker. App (remote) commands can take a while to reach the car: use a long "after" (30-60 s).</div>
+ <div class="row" style="margin-top:8px"><input id="rsettle" type="number" step="1" min="0" value="2" aria-label="settle seconds"></div>
+ <div class="hint">Settle: seconds after Climate ON/OFF ignored for state candidates (the first half of each period is always ignored).</div></div>
  <div class="spin" id="spin"></div><div id="rout"></div>
 </section>
 <section id="t-files"><div class="hint">Downloads open in a new tab (Safari); use Share from there.</div><div id="files"></div></section>
@@ -702,11 +707,21 @@ $("rrun").onclick=runDiff;
 function chipsFor(c){
   const v=x=>typeof x==="number"?x.toString(16).padStart(2,"0"):x;
   const arr=c.bytes||[],a=arr.filter(b=>!b.noisy),n=arr.filter(b=>b.noisy);
-  const ch=(b,mu)=>`<span class="chip mono${mu?" mu":""}">b${b.i}: ${esc(v(b.last_before))}&rarr;${esc(v(b.first_after))}</span>`;
+  const ch=(b,mu)=>`<span class="chip mono${mu?" mu":""}"${b.why?` title="${esc(b.why)}"`:""}>b${b.i}: ${esc(v(b.last_before))}&rarr;${esc(v(b.first_after))}</span>`;
   return a.map(b=>ch(b)).join("")+(n.length?`<a href="#" class="tg">show ${n.length} noisy</a><span style="display:none">${n.map(b=>ch(b,1)).join("")}</span>`:"")}
+function stateCards(d,nm){
+  const id=c=>`<td>${c.bus}</td><td class="mono ${nm[c.addr_hex]?"w":""}">${esc(c.addr_hex)}${c.mux?" mux "+esc(c.mux):""}${(nm[c.addr_hex]||c.name)?"<br>"+esc(nm[c.addr_hex]||c.name):""}</td><td class="mono">b${c.i}</td>`;
+  const S=d.states||[],T=d.steps||[],P=d.profile||{};
+  const ss=S.map(c=>`<tr>${id(c)}<td class="mono">ON ${esc(c.on_vals.join(","))}<br>OFF ${esc(c.off_vals.join(","))}</td><td>${c.on_periods}/${c.off_periods}${c.cyclic?' <span class="age">cyclic</span>':""}</td></tr>`).join("");
+  const ts=T.map(c=>`<tr>${id(c)}<td class="mono">${c.dirs.map((s,k)=>(s>0?"up":"dn")+" "+(c.deltas[k]>0?"+":"")+c.deltas[k]).join(", ")}</td><td>${c.matched}/${c.steps}${c.inverted?' <span class="age">inv</span>':""}</td></tr>`).join("");
+  return `<div class="card"><h3>State candidates <span class="age">ON vs OFF</span></h3>`+
+    (ss?`<table>${ss}</table>`:`<div class="hint">None. Needs Climate ON and Climate OFF markers, each held for a few seconds.</div>`)+
+    `<div class="hint">${P.ids||0} ids, ${P.cyclic||0} cyclic/mux, ${P.counter_bytes||0} counter bytes ignored.</div></div>`+
+    `<div class="card"><h3>Step candidates <span class="age">Temp up / down</span></h3>`+
+    (ts?`<table>${ts}</table>`:`<div class="hint">None. Needs Temp up / Temp down markers.</div>`)+`</div>`}
 async function runDiff(){
   const s=$("rsess").value||"latest";$("rout").innerHTML="";$("spin").style.display="block";
-  try{const d=await api(`/api/diff?session=${q(s)}&pre=${q($("rpre").value)}&post=${q($("rpost").value)}`);
+  try{const d=await api(`/api/diff?session=${q(s)}&pre=${q($("rpre").value)}&post=${q($("rpost").value)}&settle=${q($("rsettle").value)}`);
     const nm=d.names||names,W=d.watched||[];
     $("rout").innerHTML=`<div class="hint">${esc(d.session)}</div>`+(d.results.length?d.results.map((r,i)=>{
       const m=r.marker||{};const rel=m.rel_s!=null?Number(m.rel_s).toFixed(1)+" s":"";
@@ -715,7 +730,7 @@ async function runDiff(){
       return `<div class="card"><h3>${esc(m.text||"marker")} <span class="age">${rel}</span></h3>${w}<table>`+
        (r.changes||[]).map(c=>{const wn=nm[c.addr_hex];
         return `<tr><td>${c.bus}</td><td class="mono ${wn?"w":""}">${esc(c.addr_hex)}${(wn||c.name)?"<br>"+esc(wn||c.name):""}</td><td>${chipsFor(c)}`+
-        (c.new_id?` <span class="badge new">new</span>`:"")+(c.gone_id?` <span class="badge gone">gone</span>`:"")+`</td></tr>`}).join("")+`</table></div>`}).join(""):`<div class="hint">No markers in this session.</div>`)
+        (c.new_id?` <span class="badge new">new</span>`:"")+(c.gone_id?` <span class="badge gone">gone</span>`:"")+(c.kind?` <span class="age">${esc(c.kind)}</span>`:"")+`</td></tr>`}).join("")+`</table></div>`}).join(""):`<div class="hint">No markers in this session.</div>`)+stateCards(d,nm)
   }catch(e){if(e.message!=="auth")$("rout").innerHTML=`<div class="err">${esc(e.message)}</div>`}
   $("spin").style.display="none"}
 $("rout").onclick=e=>{if(e.target.classList.contains("tg")){e.preventDefault();e.target.nextSibling.style.display="inline";e.target.style.display="none"}};

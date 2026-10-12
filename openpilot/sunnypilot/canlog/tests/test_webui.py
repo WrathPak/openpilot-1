@@ -100,3 +100,17 @@ def test_static(srv):
 
 def test_no_wlan_on_pc():
   assert webui.iface_ipv4_addrs("definitely-not-an-iface0") in (set(), {"127.0.0.1"})
+
+
+def test_diff_states(srv, tmp_path):
+  from openpilot.sunnypilot.canlog.tests.test_canlog import _real_log
+  _, base, _ = srv
+  _real_log(tmp_path / "r.canlog")
+  op = client()
+  call(op, base, "/api/setpin", {"pin": "1234", "pin2": "1234"})
+  d = js(call(op, base, "/api/diff?session=r&pre=3&post=6&settle=2"))
+  assert d["results"][0]["changes"][0]["addr"] == 0x300
+  assert d["states"][0]["addr"] == 0x300 and d["states"][0]["on_vals"] == ["05"]
+  assert d["steps"][0]["addr"] == 0x16A954FB and d["profile"]["mux"] == 1
+  assert call(op, base, "/api/diff?session=r&settle=x")[0] == 400
+  assert b"stateCards" in call(op, base, "/")[1]

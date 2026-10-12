@@ -146,3 +146,96 @@ def test_diff_file_windowed(tmp_path):
   assert frames and max(f[0] for f in frames) <= 23 * S + S
   hit = [c for c in res[1]["changes"] if c["addr"] == 0x16A954FB]
   assert hit and hit[0]["bytes"][0]["last_before"] == "30" and hit[0]["bytes"][0]["first_after"] == "31"
+
+
+VIN = [bytes([0, 0, 0, 0, 0, 0x57, 0x56, 0x47]), bytes([1, 0x52, 0x4D, 0x50, 0x45, 0x32, 0x38, 0x4D]),
+       bytes([2, 0x50, 0x30, 0x33, 0x35, 0x32, 0x38, 0x30])]  # fake VIN, mux in byte 0
+BAP = [bytes([0x3D, 0x82 + k, 0x03, k, 0, 0, 0, 0]) for k in range(11)] + [bytes([0x80, 0x09, 0x3D, 0x90, 0, 0, 0, 0]), bytes([0xC0, 0, 0, 0, 0, 0])]
+CLIMATE = [("Climate ON", 10), ("Climate OFF", 30), ("Climate ON", 40), ("Climate OFF", 50)]
+STEPS = [("Temp up", 56), ("Temp up", 57.5), ("Temp down", 59), ("Temp down", 60.5)]
+LAG = 4.0  # remote command latency: the car reacts seconds after the marker
+
+
+def _real_log(path, end_s=64):
+  """Synthetic MEB-like log: VIN mux, 13-payload BAP cycle at 1 Hz, slow counter, a lagging climate state byte
+  (0x300 b2) and a setpoint (0x16A954FB) that steps with Temp up/down."""
+  lines = ["# canlog v1 started=2026-01-01T00:00:00 mono_ns=0 device=t"]
+  lines += [f"M {int(t * S)} {txt}" for txt, t in CLIMATE + STEPS]
+  sp, sp_t = 12, sorted((t + 0.5, 1 if "up" in txt else -1) for txt, t in STEPS)
+  for k in range(end_s * 10):
+    t = k / 10
+    ts = int(t * S)
+    lines.append(f"F {ts} 0 000006B4 {VIN[k % 3].hex()}")
+    if k % 10 == 0:
+      lines.append(f"F {ts} 0 17333610 {BAP[(k // 10) % len(BAP)].hex()}")
+    if k % 20 == 0:
+      lines.append(f"F {ts} 0 16A954C4 00{(k // 20 * 0x19) & 0xFF:02X}0000")
+    on = any(a + LAG <= t < b + LAG for (_, a), (_, b) in zip(CLIMATE[::2], CLIMATE[1::2], strict=True))
+    lines.append(f"F {ts} 0 00000300 1122{5 if on else 0:02X}33")
+    while sp_t and sp_t[0][0] <= t:
+      sp += sp_t.pop(0)[1]
+    lines.append(f"F {ts} 0 16A954FB 00{(sp & 3) << 6:02X}{sp >> 2:02X}00")
+  lines.sort(key=lambda s: int(s.split(" ")[1]) if s[0] in "FM" else -1)
+  path.write_text("\n".join(lines) + "\n")
+  return path
+
+
+def test_profile_detects_mux_cycle_counter(tmp_path):
+  p = _real_log(tmp_path / "r.canlog")
+  _, frames, markers = analyze.read_log(str(p))
+  prof = analyze.Profile.from_frames(frames, markers)
+  vin, bap, ctr, st = (prof.get(0, a) for a in (0x6B4, 0x17333610, 0x16A954C4, 0x300))
+  assert vin.mux and vin.cyclic and vin.bad == {0: "mux"}
+  assert bap.cyclic and not bap.mux and bap.period == len(BAP)
+  assert ctr.bad == {1: "counter"} and not ctr.cyclic
+  assert not st.cyclic and not st.bad
+  # BAP cycle unbroken everywhere, even before one full cycle has been seen
+  assert analyze.Profile.cycle_unbroken(bap, 0, 64 * S)
+
+
+def test_diff_filters_mux_cycle_counter(tmp_path):
+  p = _real_log(tmp_path / "r.canlog")
+  _, frames, markers = analyze.read_log(str(p))
+  prof = analyze.Profile.from_frames(frames, markers)
+  on = [m for m in markers if m["text"] == "Climate ON"]
+  res = analyze.diff_around_markers(frames, on, 3, 6, profile=prof)
+  for r in res:
+    top = r["changes"][0]
+    assert top["addr"] == 0x300 and [b["i"] for b in top["bytes"] if not b["noisy"]] == [2]
+    for c in r["changes"]:
+      if c["addr"] in (0x6B4, 0x17333610, 0x16A954C4):
+        assert c["score"] == 0 and all(b["noisy"] for b in c["bytes"]), c
+    whys = {c["addr"]: {b["why"] for b in c["bytes"]} for c in r["changes"]}
+    assert whys.get(0x16A954C4, {"counter"}) == {"counter"}
+  # without the profile the old rule lets the VIN mux and BAP cycle through
+  raw = analyze.diff_around_markers(frames, on[:1], 3, 6)
+  assert any(c["addr"] == 0x6B4 and c["score"] > 0 for c in raw[0]["changes"])
+
+
+def test_state_and_step_candidates(tmp_path):
+  p = _real_log(tmp_path / "r.canlog")
+  _, frames, markers = analyze.read_log(str(p))
+  states = analyze.state_candidates(frames, markers)
+  assert states and (states[0]["addr"], states[0]["i"]) == (0x300, 2)
+  assert states[0]["on_vals"] == ["05"] and states[0]["off_vals"] == ["00"] and states[0]["on_periods"] == 2
+  assert not any(c["addr"] in (0x6B4, 0x17333610, 0x16A954C4) for c in states)
+  # a 2 s settle alone would mix in the lagging OFF values; the half-period rule keeps the sets clean
+  assert analyze.state_periods(markers)[0][0] == 20 * S
+  steps = analyze.step_candidates(frames, markers)
+  assert steps[0]["addr"] == 0x16A954FB and steps[0]["matched"] == 4 and steps[0]["both_dirs"]
+  assert not any(c["addr"] in (0x6B4, 0x17333610, 0x16A954C4, 0x300) for c in steps)
+  assert "0x00000300" in analyze.format_states_text(states, steps)
+
+
+def test_analyze_file_and_cli_states(tmp_path, capsys):
+  p = _real_log(tmp_path / "r.canlog")
+  r = analyze.analyze_file(str(p), post_s=6)
+  assert r["diff"][0]["changes"][0]["addr"] == 0x300
+  assert (r["states"][0]["addr"], r["steps"][0]["addr"]) == (0x300, 0x16A954FB)
+  assert r["profile"].summary()["counter_bytes"] >= 1 and r["profile"].get(0, 0x16A954C4).bad == {1: "counter"}
+  assert max(f[0] for f in r["frames"]) <= 61 * S + 6 * S  # still windowed
+  assert analyze.main([str(p), "--states", "--json"]) == 0
+  out = json.loads(capsys.readouterr().out)
+  assert out["states"][0]["addr"] == 0x300 and out["steps"] and out["profile"]["mux"] == 1
+  assert analyze.main([str(p), "--states", "--diff"]) == 0
+  assert "State candidates" in capsys.readouterr().out

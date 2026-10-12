@@ -86,6 +86,11 @@ def _install_fake_analyze() -> None:
     {"bus": 0, "addr": 0x16A954FB, "addr_hex": "0x16A954FB", "name": "", "new_id": False, "gone_id": False, "score": 5,
      "bytes": [{"i": 0, "last_before": 4, "first_after": 5, "noisy": False}, {"i": 1, "last_before": 0, "first_after": 9, "noisy": True}]}]}]
   m.diff_file = lambda p, pre_s=3.0, post_s=3.0: ({}, [{"t": int(4.5e9), "text": "fake"}], m.diff_around_markers([], [{"t": int(4.5e9), "text": "fake"}]), [])  # type: ignore
+  m.analyze_file = lambda p, pre_s=3.0, post_s=3.0, settle_s=2.0, **kw: {  # type: ignore
+    "markers": [{"t": int(4.5e9), "text": "fake"}], "diff": m.diff_around_markers([], [{"t": int(4.5e9), "text": "fake"}]), "frames": [],
+    "states": [{"bus": 0, "addr": 0x300, "addr_hex": "0x00000300", "name": "", "mux": None, "i": 2, "cyclic": False,
+                "on_vals": ["05"], "off_vals": ["00"], "on_periods": 2, "off_periods": 2, "score": 40}],
+    "steps": [], "profile": types.SimpleNamespace(summary=lambda: {"ids": 1, "cyclic": 0, "counter_bytes": 0})}
   sys.modules[m.__name__] = m
   import openpilot.sunnypilot.canlog as pkg
   pkg.analyze = m  # type: ignore
