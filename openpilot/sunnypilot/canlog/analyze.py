@@ -889,13 +889,28 @@ def verdict(path: str, settle_s: float = 2.0, progress: Progress | None = None, 
   log, and the log span is taken from the first and last frame of each 4 MB block (frames are time-ordered).
   `buses` limits the state/step search to those buses (counts and candidates still see every bus).
   `progress(bytes_read, file_size)` is called after every 4 MB block."""
+  mk: list[dict] = []
   with _no_gc():
-    return _verdict(path, settle_s, progress, buses)
+    res = _verdict(path, settle_s, progress, buses, mk)
+  if any(_is_timer(m) for m in mk):  # guided test D: a second, windowed pass looks for the departure-timer messages
+    res["timer"] = timer_verdict(path, _scaled(progress, 0.5, 1.0), mk)
+  return res
 
 
-def _verdict(path: str, settle_s: float, progress: Progress | None, buses: set[int] | None) -> dict:
+def _scaled(progress: Progress | None, lo: float, hi: float) -> Progress | None:
+  """`progress` for a phase that covers the fraction lo..hi of the whole job."""
+  if progress is None:
+    return None
+  return lambda d, t: progress(int((lo + (hi - lo) * d / max(t, 1)) * 1000), 1000)
+
+
+def _verdict(path: str, settle_s: float, progress: Progress | None, buses: set[int] | None, mk_out: list[dict] | None = None) -> dict:
   header, raw_markers = read_markers(path)
   markers = effective_markers(raw_markers)
+  if mk_out is not None:
+    mk_out.extend(markers)
+    if any(_is_timer(m) for m in markers):
+      progress = _scaled(progress, 0.0, 0.5)
   tk = _Tracker()
   prof = Profile(markers, "Climate ON", "Climate OFF", settle_s, log_end(path))
   swin = _step_windows(markers)
@@ -970,6 +985,164 @@ def _verdict(path: str, settle_s: float, progress: Progress | None, buses: set[i
   series.clear()
   prof.finalize()
   return _verdict_report(header, markers, tk, frames, prof)
+
+
+# ---------------------------------------------------------------- guided test D: departure timer
+TIMER_PRE_S = 0.5
+TIMER_POST_S = 3.0
+TIMER_BASE_S = 60.0          # the first minute of the log is the quiet baseline (nothing is touched)
+TIMER_OUTSIDE_CAP = 300_000  # (bus, id, payload) triples remembered from outside the marker windows
+TIMER_NOISY = 200            # more distinct payloads than this on one id = counter / timestamp, not a message
+TIMER_WIN_CAP = 400          # same limit inside the windows
+BAP_OPS = ["Set", "Get", "SetGet", "HeartbeatStatus", "Status", "StatusAck", "Ack", "Error"]
+BAP_INTERESTING = {0, 2, 4, 5, 6}  # Set, SetGet, Status, StatusAck, Ack: something was written or reported; not heartbeat/get/error
+_g123 = operator.itemgetter(1, 2, 3)
+
+
+def _is_timer(m: dict) -> bool:
+  return m.get("text", "").casefold().startswith("timer ")
+
+
+def is_bap_addr(addr: int) -> bool:
+  return (addr & 0x1FFFFFFF) >> 16 == 0x1733
+
+
+def bap_decode(d: bytes) -> tuple[int, int, int] | None:
+  """(lsg, fct, opcode) of a VW BAP frame, None for continuation frames and runts."""
+  if len(d) < 2:
+    return None
+  if not d[0] & 0x80:  # short frame
+    hdr = (d[0] << 8) | d[1]
+  elif d[0] & 0xC0 == 0x80:  # start of a multi-frame message: byte 1 is the length
+    if len(d) < 4:
+      return None
+    hdr = (d[2] << 8) | d[3]
+  else:  # continuation
+    return None
+  return (hdr >> 6) & 0x3F, hdr & 0x3F, (hdr >> 12) & 7
+
+
+def _prune_outside(outside: set, noisy: set) -> set:
+  """Too many remembered payloads: forget the ids with the most distinct ones (counters, timestamps) for good."""
+  for lim in (TIMER_NOISY, 50, 10, 3):
+    cnt = Counter((k[0], k[1]) for k in outside)
+    bad = {i for i, n in cnt.items() if n > lim}
+    if bad:
+      noisy |= bad
+      outside = {k for k in outside if (k[0], k[1]) not in bad}
+    if len(outside) <= TIMER_OUTSIDE_CAP // 2:
+      break
+  return outside
+
+
+def timer_verdict(path: str, progress: Progress | None = None, markers: list[dict] | None = None) -> dict:
+  """Which messages react to departure-timer changes? One streaming pass: every frame outside the windows
+  (-0.5..+3 s around each "Timer ..." marker; this includes the quiet baseline) only teaches which payloads are normal
+  for its id; payloads seen inside a window and never outside are "new". An id whose new payloads show up at several
+  timer actions reacted to them. Ids that keep producing new payloads (counters, timestamps) are dropped, and so is
+  everything that recurs on a fixed cycle (it is seen outside the windows too)."""
+  if markers is None:
+    markers = effective_markers(read_markers(path)[1])
+  tms = sorted((m for m in markers if _is_timer(m)), key=lambda m: m["t"])
+  mt = [m["t"] for m in tms]
+  pre, post = int(TIMER_PRE_S * 1e9), int(TIMER_POST_S * 1e9)
+  wins = _merge_windows([(t - pre, t + post) for t in mt]) or []
+  t_of = lambda r: int(r[0])  # noqa: E731
+  outside: set = set()
+  noisy: set = set()
+  win: dict[tuple[bytes, bytes], dict[bytes, dict[int, int]]] = {}  # (bus, addr) -> payload hex -> {marker index: first delay ns}
+  first: int | None = None
+  for blk, tail in _chunks(path, progress):
+    if tail:
+      continue
+    rows = _FRAME_RX.findall(blk)
+    if not rows:
+      continue
+    t0, t1 = int(rows[0][0]), int(rows[-1][0])
+    if first is None:
+      first = t0
+    bs: set = set()
+    pos = 0
+    for a, b in wins:
+      if b < t0 or a > t1:
+        continue
+      i, j = bisect.bisect_left(rows, a, key=t_of), bisect.bisect_right(rows, b, key=t_of)
+      if i > pos:
+        bs.update(map(_g123, rows[pos:i]))
+      for r in rows[i:j]:
+        h = r[3]
+        if len(h) & 1:
+          continue
+        t = int(r[0])
+        d = win.setdefault((r[1], r[2]), {})
+        e = d.get(h)
+        if e is None:
+          if len(d) >= TIMER_WIN_CAP:
+            noisy.add((r[1], r[2]))
+            continue
+          e = d[h] = {}
+        for mi in range(bisect.bisect_left(mt, t - post), bisect.bisect_right(mt, t + pre)):
+          e.setdefault(mi, t - mt[mi])
+      pos = max(pos, j)
+    bs.update(map(_g123, rows[pos:]) if pos else map(_g123, rows))
+    if noisy:
+      bs = {k for k in bs if (k[0], k[1]) not in noisy}
+    outside |= bs
+    if len(outside) > TIMER_OUTSIDE_CAP:
+      outside = _prune_outside(outside, noisy)
+  seen: dict[tuple[bytes, bytes], set[bytes]] = defaultdict(set)
+  for b_, a_, h_ in outside:
+    seen[(b_, a_)].add(h_)
+  base = (markers[0]["t"] if markers else 0) if first is None else first
+  n = len(tms)
+  need = min(2, n)
+  items: list[dict] = []
+  skipped = len(noisy)
+  for k, pays in win.items():
+    old = seen.get(k, ())
+    if k in noisy or len(old) > TIMER_NOISY:
+      continue
+    new = {h: e for h, e in pays.items() if h not in old}
+    if not new:
+      continue
+    bus, addr = int(k[0]), int(k[1], 16)
+    groups: dict[tuple[int, int, int], dict] = {}
+    if is_bap_addr(addr):
+      for h, e in new.items():
+        g = bap_decode(binascii.unhexlify(h))
+        if g is not None:
+          gr = groups.setdefault(g, {"idx": {}, "pay": []})
+          gr["pay"].append(h.decode())
+          for mi, dl in e.items():
+            gr["idx"][mi] = min(dl, gr["idx"].get(mi, dl))
+    if not groups:
+      groups[None] = {"idx": {}, "pay": [h.decode() for h in new]}  # type: ignore[index]
+      for e in new.values():
+        for mi, dl in e.items():
+          groups[None]["idx"][mi] = min(dl, groups[None]["idx"].get(mi, dl))  # type: ignore[index]
+    for g, gr in groups.items():
+      idx = gr["idx"]
+      if len(idx) < need:
+        continue
+      lat = sorted(idx.values())
+      it = {"kind": "bap" if g else "id", "bus": bus, "addr": addr, "addr_hex": fmt_addr(addr), "reacted": len(idx), "total": n,
+            "latency_s": round(lat[len(lat) // 2] / 1e9, 1), "examples": gr["pay"][:3], "payloads": len(gr["pay"]), "interesting": True}
+      if g:
+        it.update(lsg=g[0], fct=g[1], opcode=g[2], opname=BAP_OPS[g[2]], interesting=g[2] in BAP_INTERESTING)
+        it["text"] = (f"BAP LSG 0x{g[0]:02X} fct {g[1]} {BAP_OPS[g[2]]}: changed at {len(idx)} of {n} timer actions, "
+                      f"bus {bus}, id {fmt_addr(addr)}")
+      else:
+        it["text"] = f"bus {bus} id {fmt_addr(addr)}: changed at {len(idx)} of {n} timer actions"
+      items.append(it)
+  items.sort(key=lambda x: (not x["interesting"], -x["reacted"], x["bus"], x["addr"], x.get("lsg", 0), x.get("fct", 0)))
+  good = [x for x in items if x["interesting"]]
+  if good:
+    head = f"Found {len(good)} message{'s' if len(good) != 1 else ''} that react{'s' if len(good) == 1 else ''} to timer changes"
+  else:
+    head = "Nothing on the visible buses reacted to timer changes — the timer is likely on a network the comma can't see"
+  return {"headline": head, "found": len(good), "timer_markers": n, "best": [x["text"] for x in good[:5]], "items": items[:60],
+          "ignored_noisy_ids": skipped,
+          "marker_list": [{"rel_s": round((m["t"] - base) / 1e9, 1), "text": m.get("text", "")} for m in tms]}
 
 
 def _verdict_report(header: dict, markers: list[dict], tk: _Tracker, frames: list[Frame], prof: Profile) -> dict:

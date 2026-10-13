@@ -211,3 +211,15 @@ def test_verdict_job_error(srv, tmp_path, monkeypatch):
   monkeypatch.undo()
   assert poll(op, base, "/api/verdict?session=g")[1]["status"] == "done"  # retry works
   assert call(op, base, "/api/verdict?session=nope")[0] == 404
+
+
+def test_timer_test_in_page_and_api(srv, tmp_path):
+  from openpilot.sunnypilot.canlog.tests.test_canlog import _timer_log
+  _, base, _ = srv
+  _timer_log(tmp_path / "t.canlog")
+  op = client()
+  call(op, base, "/api/setpin", {"pin": "1234", "pin2": "1234"})
+  page = call(op, base, "/")[1]
+  assert b'data-start="D"' in page and b"Timer time change" in page and b"Departure timer screen open" in page
+  v = poll(op, base, "/api/verdict?session=t")[1]
+  assert v["status"] == "done" and v["timer"]["found"] == 1 and v["timer"]["best"][0].startswith("BAP LSG 0x1D fct 17 Status")

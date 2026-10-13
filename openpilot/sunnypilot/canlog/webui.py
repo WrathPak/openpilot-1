@@ -780,6 +780,8 @@ button.giant.alt{min-height:72px;font-size:22px;background:#3a3a40;border-color:
    <p>Car asleep. Send a remote climate START and STOP from the app. About 6 minutes.</p><button data-start="B">Start</button></div>
   <div class="card tcard"><h3>C. Wake-up only (key fob)</h3>
    <p>Car asleep. Unlock with the fob and watch what wakes up. About 2 minutes.</p><button data-start="C">Start</button></div>
+  <div class="card tcard"><h3>D. Departure timer</h3>
+   <p>Change departure timer 1 on the car's display (time, climate, enable) when told. Finds whether the timer settings travel over a network the comma can see. About 9 minutes.</p><button data-start="D">Start</button></div>
   <details class="card" id="manual"><summary>Manual mode</summary>
    <div style="height:10px"></div>
    <button class="big" id="rec">START LOGGING</button>
@@ -1002,6 +1004,17 @@ function buildSteps(id){
     S.push({k:"confirm",t:"Tap when the app confirms",b:"APP CONFIRMED START",m:"Remote START confirmed"});W(60);
     A("Send remote climate STOP now","I SENT STOP","Remote STOP sent");
     S.push({k:"confirm",t:"Tap when the app confirms",b:"APP CONFIRMED STOP",m:"Remote STOP confirmed"});W(60,"Last wait: don't touch anything");
+  }else if(id==="D"){
+    W(60,"Baseline: don't touch anything");
+    for(let i=0;i<3;i++){A("Change departure timer 1's TIME by one step (e.g. +5 min)","I CHANGED THE TIME","Timer time change",1);W(20)}
+    for(let i=0;i<2;i++){
+      A("Turn CLIMATE ON for timer 1","I TURNED CLIMATE ON","Timer climate ON",1);W(20);
+      A("Turn CLIMATE OFF for timer 1","I TURNED CLIMATE OFF","Timer climate OFF",1);W(20)}
+    for(let i=0;i<2;i++){
+      A("ENABLE timer 1","I ENABLED THE TIMER","Timer enable",1);W(20);
+      A("DISABLE timer 1","I DISABLED THE TIMER","Timer disable",1);W(20)}
+    S.push({k:"ask",t:"Optional: change a departure-timer DAY (e.g. add Monday)",bs:[{l:"I CHANGED A DAY",m:"Timer day change",n:1},{l:"SKIP",go:"tail"}]});
+    W(30,"Almost done: don't touch anything",{id:"tail"});
   }else{
     W(30,"Baseline: don't touch anything");
     A("Unlock the car with the key fob now","I PRESSED UNLOCK","Fob unlock");W(60);
@@ -1010,7 +1023,8 @@ function buildSteps(id){
 const TESTS={
   A:{name:"A. Climate buttons in the car",alive:true,pre:["Comma plugged into the car","Car switched on","Always Offroad is ON (Settings → Device)","Phone connected to the comma"]},
   B:{name:"B. Remote start from the VW app",alive:false,pre:["Car locked and asleep (untouched for 5+ minutes)","Phone connected to the comma","Max Time Offroad is 0"]},
-  C:{name:"C. Wake-up only (key fob)",alive:false,pre:["Car locked and asleep (untouched for 5+ minutes)","Phone connected to the comma","Max Time Offroad is 0"]}};
+  C:{name:"C. Wake-up only (key fob)",alive:false,pre:["Car locked and asleep (untouched for 5+ minutes)","Phone connected to the comma","Max Time Offroad is 0"]},
+  D:{name:"D. Departure timer",alive:true,pre:["Comma plugged into the car","Car switched on","Always Offroad is ON (Settings → Device)","Phone connected to the comma","Departure timer screen open on the car's display"]}};
 const LSK="canlog_test_v1";
 let T=null, STEPS=[], busy=false, pendingId=null, AC=null, WL=null, resumed=false, liveBusy=false;
 function save(){try{if(T)localStorage.setItem(LSK,JSON.stringify(T));else localStorage.removeItem(LSK)}catch(e){}}
@@ -1128,8 +1142,16 @@ async function showVerdict(sess){
   $("vSpin").style.display="none";jobDone($("vProg"),$("vBar"));$("vTitle").textContent="Test result";
   const ev=c=>c.events.length?`<table><tr><th>Marker</th><th>at</th><th>Result</th><th>Changed after</th></tr>`+c.events.map(e=>
     `<tr><td>${esc(e.text)}</td><td>${e.rel_s} s</td><td>${e.ok===null?esc(e.note):(e.ok?"yes":"no")+(e.note?" ("+esc(e.note)+")":"")}</td><td>${e.flip_s===null?"-":e.flip_s+" s"}</td></tr>`).join("")+`</table>`:`<div class="hint">No matching markers.</div>`;
-  let h=v.candidates.map(c=>`<div class="vline ${c.level}"><span class="badge" style="background:#0006">${LV[c.level]}</span> ${esc(c.summary)}</div>`+
-    `<details class="sub"><summary>Details: ${esc(c.label)} (${esc(c.addr_hex)}, bus ${c.bus}, ${c.frames} frames)</summary>${ev(c)}</details>`).join("");
+  let h="";
+  if(v.timer){const tm=v.timer;
+    h+=`<div class="vline ${tm.found?"green":"red"}"><b>${esc(tm.headline)}</b></div>`;
+    if(tm.best.length)h+=`<div class="card"><h3>Best candidates</h3>${tm.best.map(x=>`<div class="mono" style="font-size:13px;margin:6px 0">${esc(x)}</div>`).join("")}</div>`;
+    const tr=(tm.items||[]).map(x=>`<tr><td>${x.interesting?"<b>*</b>":""}</td><td>${esc(x.text)}</td><td class="mono">${esc((x.examples||[]).join(" "))}</td><td>${x.latency_s} s</td></tr>`).join("");
+    h+=`<details class="sub"${tm.found?"":" open"}><summary>Details: every message that changed near a timer action (${(tm.items||[]).length})</summary>`+
+      (tr?`<table><tr><th></th><th>Message</th><th>New payloads</th><th>After</th></tr>${tr}</table><div class="hint">* = Set / SetGet / Status / StatusAck / Ack: something was written or reported. Heartbeats and Get requests are listed but not counted.</div>`:`<div class="hint">None.</div>`)+
+      `<div class="hint">${tm.timer_markers} timer actions checked (-0.5 s to +3 s around each). Payloads that also appear at other times, counters and fixed cycles are ignored${tm.ignored_noisy_ids?" ("+tm.ignored_noisy_ids+" busy ids skipped)":""}.</div></details>`}
+  h+=(v.timer?`<details class="sub"><summary>Climate checks (not part of this test)</summary>`:"")+v.candidates.map(c=>`<div class="vline ${c.level}"><span class="badge" style="background:#0006">${LV[c.level]}</span> ${esc(c.summary)}</div>`+
+    `<details class="sub"><summary>Details: ${esc(c.label)} (${esc(c.addr_hex)}, bus ${c.bus}, ${c.frames} frames)</summary>${ev(c)}</details>`).join("")+(v.timer?`</details>`:"");
   const bs=Object.keys(v.buses||{});
   h+=`<div class="card"><h3>What was recorded</h3><div>${v.markers} markers, ${v.log_seconds} s of log</div>`+
     (bs.length?bs.map(b=>`<div class="hint">Bus ${b}: ${v.buses[b].frames} frames, ${v.buses[b].ids} different ids</div>`).join(""):`<div class="err">No CAN frames in this log at all.</div>`)+

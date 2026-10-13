@@ -319,3 +319,50 @@ def test_numbered_markers_prefix_match(tmp_path):
   steps = analyze.step_candidates(frames, markers)
   assert steps[0]["addr"] == 0x16A954FB and steps[0]["matched"] == 4
   assert len(analyze.state_periods(markers)) == 4
+
+
+def _timer_log(path, react=True, n=7):
+  """BAP Status 4751 on 0x17331C10 (LSG 0x1D fct 17) shows a new value 0.5 s after every Timer marker; BAP heartbeat on
+  0x17331C20 cycles through 5 payloads; 0x300 has a free-running counter; 0x555 never changes."""
+  marks = [(f"Timer time change #{i + 1}", 70 + 30 * i) for i in range(n)]
+  lines = ["# canlog v1 started=2026-01-01T00:00:00 mono_ns=0 device=t"] + [f"M {int(t * S)} {txt}" for txt, t in marks]
+  end = 70 + 30 * n + 10
+  for k in range(end * 10):
+    t = k / 10
+    hb = [0x3000 | (0x1D << 6) | 5, 0x3000 | (0x1D << 6) | 6, 0x3000 | (0x1D << 6) | 7, 0x3000 | (0x10 << 6) | 1, 0x3000][k % 5]
+    lines.append(f"F {int(t * S)} 1 17331C20 {hb:04X}000000")
+    lines.append(f"F {int(t * S)} 0 00000300 {k % 256:02X}00000000000000")
+    lines.append(f"F {int(t * S)} 0 00000555 0102030405060708")
+    hit = react and any(abs(t - (70 + 30 * i + 0.5)) < 0.01 for i in range(n))
+    if k % 10 == 0 or hit:
+      i = round((t - 70.5) / 30) if hit else 0
+      lines.append(f"F {int(t * S)} 1 17331C10 4751{(i + 1) if hit else 0:02X}0000")
+  lines.sort(key=lambda s: int(s.split(" ")[1]) if s[0] in "FM" else -1)
+  path.write_text("\n".join(lines) + "\n")
+  return path
+
+
+def test_bap_decode():
+  assert analyze.bap_decode(bytes.fromhex("47510000")) == (0x1D, 17, 4)
+  assert analyze.bap_decode(bytes.fromhex("800847510000")) == (0x1D, 17, 4)
+  assert analyze.bap_decode(bytes.fromhex("C0112233")) is None and analyze.bap_decode(b"\x47") is None
+
+
+def test_timer_verdict_found(tmp_path):
+  v = analyze.timer_verdict(str(_timer_log(tmp_path / "t.canlog")))
+  assert v["headline"] == "Found 1 message that reacts to timer changes" and v["found"] == 1 and v["timer_markers"] == 7
+  assert v["best"] == ["BAP LSG 0x1D fct 17 Status: changed at 7 of 7 timer actions, bus 1, id 0x17331C10"]
+  assert [x["addr"] for x in v["items"]] == [0x17331C10]  # heartbeat cycle, counter and the constant id are ignored
+
+
+def test_timer_verdict_nothing(tmp_path):
+  v = analyze.timer_verdict(str(_timer_log(tmp_path / "t.canlog", react=False)))
+  assert v["found"] == 0 and v["items"] == [] and v["headline"].startswith("Nothing on the visible buses reacted to timer changes")
+
+
+def test_verdict_includes_timer_only_with_timer_markers(tmp_path):
+  p = _timer_log(tmp_path / "t.canlog")
+  seen = []
+  v = analyze.verdict(str(p), progress=lambda d, t: seen.append(d / t))
+  assert v["timer"]["found"] == 1 and seen == sorted(seen) and 0 < seen[0] < 0.6 and seen[-1] > 0.9
+  assert "timer" not in analyze.verdict(str(_guided_log(tmp_path / "g.canlog")))
