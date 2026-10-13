@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import socket
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import zlib
+from collections.abc import Callable
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -162,6 +164,122 @@ class Ctx:
     self.auth = Auth()
     self.addrs: set[str] = set()
     self.any = False
+    self.jobs = Jobs()
+
+
+# ---------------------------------------------------------------- background analysis
+CACHE_VERSION = 1  # bump when the verdict output changes: older .verdict.json files are ignored
+
+
+def _sig(path: str) -> list:
+  st = os.stat(path)
+  return [st.st_mtime, st.st_size]
+
+
+def cache_path(log_path: str) -> str:
+  return os.path.splitext(log_path)[0] + ".verdict.json"
+
+
+class Jobs:
+  """One worker thread runs the analyses one after the other; requests only look at the job table.
+  A job is keyed by (kind, log path, params); asking again while it runs joins it. Finished results stay in memory
+  (the last few) and, for verdicts, on disk next to the log, keyed by the log's (mtime, size)."""
+  KEEP = 6
+
+  def __init__(self) -> None:
+    self.lock = threading.Lock()
+    self.jobs: dict[tuple, dict] = {}
+    self.q: queue.Queue = queue.Queue()
+    self.thread: threading.Thread | None = None
+
+  def _disk_get(self, path: str, sig: list) -> dict | None:
+    try:
+      with open(cache_path(path)) as f:
+        d = json.load(f)
+      if d.get("v") == CACHE_VERSION and d.get("sig") == sig and isinstance(d.get("result"), dict):
+        return d["result"]
+    except (OSError, ValueError):
+      pass
+    return None
+
+  def _disk_put(self, path: str, sig: list, result: dict) -> None:
+    tmp = cache_path(path) + ".tmp"
+    try:
+      with open(tmp, "w") as f:
+        json.dump({"v": CACHE_VERSION, "sig": sig, "result": result}, f, default=str)
+      os.replace(tmp, cache_path(path))
+    except (OSError, TypeError, ValueError) as e:
+      _log.warning("canlog verdict cache write failed: %r", e)
+      try:
+        os.remove(tmp)
+      except OSError:
+        pass
+
+  def poll(self, key: tuple, path: str, fn: Callable[[Callable[[int, int], None]], dict], disk: bool = False) -> dict:
+    """Status of the job for `key`, starting it if needed: {"status": "running", "progress": f} | {"status": "done", ...} |
+    {"status": "error", "error": msg}. fn(progress_callback) -> JSON-able dict."""
+    try:
+      sig = _sig(path)
+    except OSError as e:
+      return {"status": "error", "error": f"cannot read log: {e}"}
+    with self.lock:
+      j = self.jobs.get(key)
+      if j is not None and (j["sig"] == sig or j["state"] == "running"):  # a growing file must not restart the job on every poll
+        return self._view(key, j)
+      if j is not None:
+        del self.jobs[key]
+    if disk:
+      cached = self._disk_get(path, sig)
+      if cached is not None:
+        with self.lock:
+          self.jobs[key] = {"sig": sig, "state": "done", "progress": 1.0, "result": cached, "t": time.time()}
+          self._trim()
+        return dict(cached, status="done", progress=1.0)
+    with self.lock:
+      j = self.jobs.get(key)
+      if j is None or j["sig"] != sig:
+        j = self.jobs[key] = {"sig": sig, "state": "running", "progress": 0.0, "t": time.time(), "path": path, "disk": disk}
+        self.q.put((key, j, fn))
+        if self.thread is None or not self.thread.is_alive():
+          self.thread = threading.Thread(target=self._worker, daemon=True, name="canlog-analysis")
+          self.thread.start()
+      return self._view(key, j)
+
+  def _view(self, key: tuple, j: dict) -> dict:  # lock held
+    if j["state"] == "done":
+      return dict(j["result"], status="done", progress=1.0)
+    if j["state"] == "error":
+      del self.jobs[key]  # delivered once; asking again retries
+      return {"status": "error", "error": j["error"]}
+    return {"status": "running", "progress": round(j["progress"], 3)}
+
+  def _trim(self) -> None:  # lock held
+    done = sorted((j["t"], k) for k, j in self.jobs.items() if j["state"] == "done")
+    for _, k in done[:max(0, len(done) - self.KEEP)]:
+      del self.jobs[k]
+
+  def _worker(self) -> None:
+    try:
+      os.nice(10)  # whole-process priority on Linux: the logger itself is not time critical
+    except (AttributeError, OSError):
+      pass
+    while True:
+      key, j, fn = self.q.get()
+
+      def prog(done: int, total: int, j: dict = j) -> None:
+        if total > 0:
+          j["progress"] = max(j["progress"], min(0.99, done / total))
+      try:
+        res = fn(prog)
+        if j["disk"]:
+          self._disk_put(j["path"], j["sig"], res)
+        with self.lock:
+          j.update(state="done", result=res, progress=1.0, t=time.time())
+          self._trim()
+      except BaseException as e:  # noqa: BLE001 - a failed analysis must never kill the worker
+        _log.warning("canlog analysis failed: %r", e)
+        with self.lock:
+          j.update(state="error", error=f"{type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------- diff helpers
@@ -214,6 +332,22 @@ def _watch() -> dict[int, str]:
     return dict(WATCH)
   except Exception:
     return {0x16A954FB: "Climate setpoint", 0x16A95493: "Heating active", 0x1B000010: "NMH_Gateway"}
+
+
+def build_diff(name: str, p: str, pre: float, post: float, settle: float, progress: Callable[[int, int], None] | None = None) -> dict:
+  from openpilot.sunnypilot.canlog import analyze
+  res = analyze.analyze_file(p, pre_s=pre, post_s=post, settle_s=settle, progress=progress)
+  markers, results, frames = res["markers"], res["diff"], res["frames"]
+  for r in results:
+    r["changes"] = list(r.get("changes", []))[:60]
+  w = _watch()
+  try:
+    from openpilot.sunnypilot.canlog.decode import decode as dec
+  except Exception:
+    def dec(a: int, d: bytes) -> dict: return {}
+  return {"session": name, "pre": pre, "post": post, "results": results, "names": {_fa(k): v for k, v in w.items()},
+          "watched": watched_summary(frames, markers, w, dec, post_ns=int(post * 1e9)),
+          "states": res["states"][:30], "steps": res["steps"][:30], "profile": res["profile"].summary()}
 
 
 # ---------------------------------------------------------------- handler
@@ -413,10 +547,14 @@ class Handler(BaseHTTPRequestHandler):
     sp = self._session(q)
     if sp is None:
       return
-    from openpilot.sunnypilot.canlog import analyze
-    res = analyze.verdict(sp[1])
-    res["session"] = sp[0]
-    self._json(res)
+    name, p = sp
+
+    def run(prog: Callable[[int, int], None]) -> dict:
+      from openpilot.sunnypilot.canlog import analyze
+      res = analyze.verdict(p, progress=prog)
+      res["session"] = name
+      return res
+    self._json(self.ctx.jobs.poll(("verdict", p), p, run, disk=True))
 
   def _diff(self, q: dict[str, str]) -> None:
     sp = self._session(q)
@@ -428,19 +566,7 @@ class Handler(BaseHTTPRequestHandler):
       settle = max(0.0, min(600.0, float(q.get("settle", 2))))
     except ValueError:
       return self._err(400, "bad pre/post/settle")
-    from openpilot.sunnypilot.canlog import analyze
-    res = analyze.analyze_file(p, pre_s=pre, post_s=post, settle_s=settle)
-    markers, results, frames = res["markers"], res["diff"], res["frames"]
-    for r in results:
-      r["changes"] = list(r.get("changes", []))[:60]
-    w = _watch()
-    try:
-      from openpilot.sunnypilot.canlog.decode import decode as dec
-    except Exception:
-      def dec(a: int, d: bytes) -> dict: return {}
-    self._json({"session": name, "pre": pre, "post": post, "results": results, "names": {_fa(k): v for k, v in w.items()},
-                "watched": watched_summary(frames, markers, w, dec, post_ns=int(post * 1e9)),
-                "states": res["states"][:30], "steps": res["steps"][:30], "profile": res["profile"].summary()})
+    self._json(self.ctx.jobs.poll(("diff", p, pre, post, settle), p, lambda prog: build_diff(name, p, pre, post, settle, prog)))
 
   def _download(self, rel: str, q: dict[str, str]) -> None:
     rel = unquote(rel)
@@ -677,6 +803,7 @@ button.giant.alt{min-height:72px;font-size:22px;background:#3a3a40;border-color:
  <div id="tVerdict" style="display:none">
   <h2 id="vTitle" style="font-size:22px">Test result</h2>
   <div class="spin" id="vSpin"></div>
+  <div class="hint" id="vProg" style="text-align:center"></div><div class="prog" id="vBar" style="display:none"><div id="vBarIn"></div></div>
   <div id="vOut"></div>
  </div>
 </section>
@@ -687,7 +814,7 @@ button.giant.alt{min-height:72px;font-size:22px;background:#3a3a40;border-color:
  <div class="hint">Seconds before / after each marker. App (remote) commands can take a while to reach the car: use a long "after" (30-60 s).</div>
  <div class="row" style="margin-top:8px"><input id="rsettle" type="number" step="1" min="0" value="2" aria-label="settle seconds"></div>
  <div class="hint">Settle: seconds after Climate ON/OFF ignored for state candidates (the first half of each period is always ignored).</div></div>
- <div class="spin" id="spin"></div><div id="rout"></div>
+ <div class="spin" id="spin"></div><div class="hint" id="rProgT" style="text-align:center"></div><div class="prog" id="rBar" style="display:none"><div id="rBarIn"></div></div><div id="rout"></div>
 </section>
 <section id="t-files"><div class="hint">Downloads open in a new tab (Safari); use Share from there.</div><div id="files"></div></section>
 <footer><div id="addrs"></div><div>Forgot PIN? Delete /data/canlogs/pin.json over SSH.</div><button class="sm" id="lock" style="margin-top:8px">Lock</button></footer>
@@ -720,6 +847,21 @@ async function api(p,o){
   let d={};try{d=await r.json()}catch(e){}
   if(!r.ok){const e=new Error(d.error||r.statusText);e.status=r.status;throw e}
   return d}
+// slow analyses run as a background job on the comma: poll every second until it is done (or the caller's token changes)
+const JOB_LONG_MS=300000;
+async function jobGet(url,txt,bar,barIn,tok){
+  const t0=Date.now();
+  for(;;){
+    const r=await api(url);
+    if(tok&&tok.cancel)return null;
+    if(r.status==="error")throw new Error(r.error||"analysis failed");
+    if(r.status!=="running")return r;
+    const pc=Math.round(Math.max(0,Math.min(1,r.progress||0))*100);
+    txt.textContent="Analysing\u2026 "+pc+"%"+(Date.now()-t0>JOB_LONG_MS?" \u2014 Analysis is taking long \u2014 you can still download the log from Files":"");
+    bar.style.display="block";barIn.style.width=pc+"%";
+    await new Promise(ok=>setTimeout(ok,1000));
+    if(tok&&tok.cancel)return null}}
+function jobDone(txt,bar){txt.textContent="";bar.style.display="none"}
 function post(p,b){return api(p,{method:"POST",body:JSON.stringify(b||{})})}
 function setAuth(s){
   authState=s;document.body.dataset.auth=s;
@@ -822,9 +964,11 @@ function stateCards(d,nm){
     `<div class="hint">${P.ids||0} ids, ${P.cyclic||0} cyclic/mux, ${P.counter_bytes||0} counter bytes ignored.</div></div>`+
     `<div class="card"><h3>Step candidates <span class="age">Temp up / down</span></h3>`+
     (ts?`<table>${ts}</table>`:`<div class="hint">None. Needs Temp up / Temp down markers.</div>`)+`</div>`}
+let dTok=null;
 async function runDiff(){
   const s=$("rsess").value||"latest";$("rout").innerHTML="";$("spin").style.display="block";
-  try{const d=await api(`/api/diff?session=${q(s)}&pre=${q($("rpre").value)}&post=${q($("rpost").value)}&settle=${q($("rsettle").value)}`);
+  if(dTok)dTok.cancel=true;const tok=dTok={cancel:false};
+  try{const d=await jobGet(`/api/diff?session=${q(s)}&pre=${q($("rpre").value)}&post=${q($("rpost").value)}&settle=${q($("rsettle").value)}`,$("rProgT"),$("rBar"),$("rBarIn"),tok);if(!d)return;
     const nm=d.names||names,W=d.watched||[];
     $("rout").innerHTML=`<div class="hint">${esc(d.session)}</div>`+(d.results.length?d.results.map((r,i)=>{
       const m=r.marker||{};const rel=m.rel_s!=null?Number(m.rel_s).toFixed(1)+" s":"";
@@ -834,8 +978,8 @@ async function runDiff(){
        (r.changes||[]).map(c=>{const wn=nm[c.addr_hex];
         return `<tr><td>${c.bus}</td><td class="mono ${wn?"w":""}">${esc(c.addr_hex)}${(wn||c.name)?"<br>"+esc(wn||c.name):""}</td><td>${chipsFor(c)}`+
         (c.new_id?` <span class="badge new">new</span>`:"")+(c.gone_id?` <span class="badge gone">gone</span>`:"")+(c.kind?` <span class="age">${esc(c.kind)}</span>`:"")+`</td></tr>`}).join("")+`</table></div>`}).join(""):`<div class="hint">No markers in this session.</div>`)+stateCards(d,nm)
-  }catch(e){if(e.message!=="auth")$("rout").innerHTML=`<div class="err">${esc(e.message)}</div>`}
-  $("spin").style.display="none"}
+  }catch(e){if(tok.cancel)return;if(e.message!=="auth")$("rout").innerHTML=`<div class="err">${esc(e.message)}</div><a class="btn" target="_blank" href="/logs/${q(s)}.canlog?gz=1">Download log (.gz)</a>`}
+  $("spin").style.display="none";jobDone($("rProgT"),$("rBar"))}
 $("rout").onclick=e=>{if(e.target.classList.contains("tg")){e.preventDefault();e.target.nextSibling.style.display="inline";e.target.style.display="none"}};
 // ---------------------------------------------------------------- guided tests
 // step kinds: wait (auto-advance), act (one button + marker), ask (buttons, optional jump), confirm (button, clock, no auto-advance)
@@ -879,7 +1023,7 @@ function beep(n){try{prime();for(let i=0;i<(n||1);i++){const o=AC.createOscillat
 async function wake(){try{if(T&&navigator.wakeLock&&!WL){WL=await navigator.wakeLock.request("screen");WL.addEventListener("release",()=>{WL=null})}}catch(e){WL=null}}
 function unwake(){try{WL&&WL.release()}catch(e){}WL=null}
 const fmt=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")};
-function showHome(){$("tHome").style.display="";$("tPre").style.display="none";$("tVerdict").style.display="none"}
+function showHome(){if(vTok)vTok.cancel=true;$("tHome").style.display="";$("tPre").style.display="none";$("tVerdict").style.display="none"}
 document.querySelectorAll("[data-start]").forEach(b=>b.onclick=()=>showPre(b.dataset.start));
 function showPre(id){
   pendingId=id;const t=TESTS[id];$("pTitle").textContent=t.name;$("pErr").style.display="none";
@@ -971,14 +1115,17 @@ function resumeOnce(){
   T=x;STEPS=buildSteps(T.id);if(T.idx>=STEPS.length){finishTest(false);return}
   $("run").classList.add("on");showStep();wake()}
 // ---------------------------------------------------------------- verdict
+let vTok=null;
 const LV={green:"LOOKS RIGHT",yellow:"MAYBE",red:"NO"};
 async function showVerdict(sess){
   $("tHome").style.display="none";$("tPre").style.display="none";$("tVerdict").style.display="";
   $("vOut").innerHTML="";$("vSpin").style.display="block";$("vTitle").textContent="Analysing "+sess+" ...";window.scrollTo(0,0);
+  if(vTok)vTok.cancel=true;const tok=vTok={cancel:false};
   let v;
-  try{v=await api("/api/verdict?session="+q(sess))}
-  catch(e){$("vSpin").style.display="none";$("vTitle").textContent="Test result";if(e.message!=="auth")$("vOut").innerHTML=`<div class="box bad">Could not analyse: ${esc(e.message)}</div><button class="sm" id="vDone" style="width:100%">Done</button>`;bindDone();return}
-  $("vSpin").style.display="none";$("vTitle").textContent="Test result";
+  try{v=await jobGet("/api/verdict?session="+q(sess),$("vProg"),$("vBar"),$("vBarIn"),tok);if(!v)return}
+  catch(e){if(tok.cancel)return;$("vSpin").style.display="none";jobDone($("vProg"),$("vBar"));$("vTitle").textContent="Test result";
+    if(e.message!=="auth")$("vOut").innerHTML=`<div class="box bad">Could not analyse: ${esc(e.message)}</div><div class="row" style="margin:12px 0"><a class="btn" style="min-height:56px" target="_blank" href="/logs/${q(sess)}.canlog?gz=1">Download log (.gz)</a></div><button class="sm" id="vDone" style="width:100%">Done</button>`;bindDone();return}
+  $("vSpin").style.display="none";jobDone($("vProg"),$("vBar"));$("vTitle").textContent="Test result";
   const ev=c=>c.events.length?`<table><tr><th>Marker</th><th>at</th><th>Result</th><th>Changed after</th></tr>`+c.events.map(e=>
     `<tr><td>${esc(e.text)}</td><td>${e.rel_s} s</td><td>${e.ok===null?esc(e.note):(e.ok?"yes":"no")+(e.note?" ("+esc(e.note)+")":"")}</td><td>${e.flip_s===null?"-":e.flip_s+" s"}</td></tr>`).join("")+`</table>`:`<div class="hint">No matching markers.</div>`;
   let h=v.candidates.map(c=>`<div class="vline ${c.level}"><span class="badge" style="background:#0006">${LV[c.level]}</span> ${esc(c.summary)}</div>`+

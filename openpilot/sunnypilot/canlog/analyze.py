@@ -533,13 +533,13 @@ class Profile:
 
 def analyze_file(path: str, pre_s: float = 3.0, post_s: float = 3.0, noise_pre_s: float = 10.0,
                  on_text: str = "Climate ON", off_text: str = "Climate OFF", up_text: str = "Temp up",
-                 down_text: str = "Temp down", settle_s: float = 2.0) -> dict:
+                 down_text: str = "Temp down", settle_s: float = 2.0, progress: Progress | None = None) -> dict:
   """One pass: whole-log profile + frames near markers only. Returns header, markers, diff, states, steps, frames."""
   _, markers = read_markers(path)
   prof = Profile(markers, on_text, off_text, settle_s, log_end(path))
   span = int(max(pre_s, noise_pre_s) * 1e9)
   windows = [(m["t"] - span, m["t"] + int(post_s * 1e9)) for m in markers]
-  header, frames, markers = read_log(path, windows=windows if windows else [(0, 0)], profile=prof)
+  header, frames, markers = read_log(path, windows=windows if windows else [(0, 0)], profile=prof, progress=progress)
   prof.finalize()
   return {"header": header, "markers": markers, "frames": frames, "profile": prof,
           "diff": diff_around_markers(frames, markers, pre_s, post_s, noise_pre_s, profile=prof),
