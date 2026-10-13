@@ -1,10 +1,16 @@
 import argparse
+import binascii
 import bisect
+import contextlib
+import gc
 import json
+import operator
 import os
+import re
 import sys
-from collections import defaultdict
-from collections.abc import Callable
+from array import array
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator
 
 from openpilot.sunnypilot.canlog import config
 from openpilot.sunnypilot.canlog.decode import WATCH, decode, fmt_addr, parse_addr
@@ -28,20 +34,77 @@ def _parse_header(s: str) -> dict:
   return header
 
 
+READ_CHUNK = 4 << 20
+# loose on purpose (3x faster than checking hex pairs in the pattern): rows with an odd number of hex digits are dropped by the callers
+_FRAME_RX = re.compile(rb"^F ([0-9]+) ([0-9]+) ([0-9A-Fa-f]+) ([0-9A-Fa-f]*)\r?$", re.M)
+_POW = [1 << v for v in range(256)]
+_g1 = operator.itemgetter(1)
+_g12 = operator.itemgetter(1, 2)
+
+Progress = Callable[[int, int], None]
+
+
+@contextlib.contextmanager
+def _no_gc() -> Iterator[None]:
+  """A scan allocates millions of small tuples that all stay alive: the cyclic GC would rescan them again and again."""
+  was = gc.isenabled()
+  gc.disable()
+  try:
+    yield
+  finally:
+    if was:
+      gc.enable()
+
+
+def _chunks(path: str, progress: Progress | None = None, size: int = READ_CHUNK) -> Iterator[tuple[bytes, bool]]:
+  """Yield (block, is_tail): blocks of whole lines, then the unterminated last line (is_tail=True) if any.
+  `progress(bytes_read, file_size)` is called after every block."""
+  total = os.path.getsize(path)
+  done = 0
+  rest = b""
+  with open(path, "rb") as f:
+    while True:
+      blk = f.read(size)
+      if not blk:
+        break
+      done += len(blk)
+      blk = rest + blk
+      k = blk.rfind(b"\n") + 1
+      rest = blk[k:]
+      if k:
+        yield blk[:k], False
+      if progress:
+        progress(done, total)
+  if rest:
+    yield rest, True
+
+
+def _scan_meta(blk: bytes, header: dict, markers: list[dict]) -> None:
+  """Markers and the first "# canlog" header line of a block (memchr-fast; never parses frames)."""
+  b = b"\n" + blk
+  j = b.find(b"\nM ")
+  while j >= 0:
+    e = b.find(b"\n", j + 1)
+    ln = b[j + 3:e if e >= 0 else len(b)].decode("utf-8", "replace").rstrip("\r\n")
+    p = ln.split(" ", 1)
+    try:
+      markers.append({"t": int(p[0]), "text": p[1] if len(p) > 1 else ""})
+    except ValueError:
+      pass
+    j = b.find(b"\nM ", e) if e >= 0 else -1
+  if not header:
+    j = b.find(b"\n# canlog")
+    if j >= 0:
+      e = b.find(b"\n", j + 1)
+      header.update(_parse_header(b[j + 1:e if e >= 0 else len(b)].decode("utf-8", "replace").rstrip("\r\n")))
+
+
 def read_markers(path: str) -> tuple[dict, list[dict]]:
   """Cheap scan: header + markers only (no frame parsing)."""
   header: dict = {}
   markers: list[dict] = []
-  with open(path, "rb") as f:
-    for ln in f:
-      if ln[:2] == b"M ":
-        p = ln.decode("utf-8", "replace").rstrip("\r\n").split(" ", 2)
-        try:
-          markers.append({"t": int(p[1]), "text": p[2] if len(p) > 2 else ""})
-        except (ValueError, IndexError):
-          pass
-      elif ln[:8] == b"# canlog" and not header:
-        header = _parse_header(ln.decode("utf-8", "replace").rstrip("\r\n"))
+  for blk, _ in _chunks(path):
+    _scan_meta(blk, header, markers)
   return header, markers
 
 
@@ -60,58 +123,82 @@ def log_end(path: str) -> int | None:
   return None
 
 
+def _merge_windows(windows: list[tuple[int, int]] | None) -> list[tuple[int, int]] | None:
+  if not windows:
+    return None
+  merged: list[tuple[int, int]] = []
+  for a, b in sorted(windows):
+    if merged and a <= merged[-1][1]:
+      merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+    else:
+      merged.append((a, b))
+  return merged
+
+
 def read_log(path: str, windows: list[tuple[int, int]] | None = None,
-             profile: "Profile | None" = None, tap: Callable[[int, int, int, bytes], None] | None = None
-             ) -> tuple[dict, list[Frame], list[dict]]:
+             profile: "Profile | None" = None, tap: Callable[[int, int, int, bytes], None] | None = None,
+             progress: Progress | None = None) -> tuple[dict, list[Frame], list[dict]]:
   """Stream-parse a .canlog. `windows` = [(t0, t1), ...] in mono ns keeps only frames inside any window.
-  `profile` and `tap` (a callable(t, bus, addr, data)), if given, see every frame of the log (windowed or not)."""
+  `profile` and `tap` (a callable(t, bus, addr, data)), if given, see every frame of the log (windowed or not).
+  `progress(bytes_read, file_size)` is called after every 4 MB block."""
+  with _no_gc():
+    return _read_log(path, windows, profile, tap, progress)
+
+
+def _read_log(path: str, windows: list[tuple[int, int]] | None, profile: "Profile | None",
+              tap: Callable[[int, int, int, bytes], None] | None, progress: Progress | None) -> tuple[dict, list[Frame], list[dict]]:
   header: dict = {}
   frames: list[Frame] = []
   markers: list[dict] = []
-  if windows:
-    merged: list[tuple[int, int]] = []
-    for a, b in sorted(windows):
-      if merged and a <= merged[-1][1]:
-        merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-      else:
-        merged.append((a, b))
-    windows = merged
-  else:
-    windows = None
-  with open(path, "rb") as f:
-    for ln in f:
-      complete = ln.endswith(b"\n")
-      try:
-        s = ln.decode("utf-8", "replace").rstrip("\r\n")
-        if not s:
-          continue
-        if s[0] == "F":
-          if not complete:
-            continue  # truncated last line
-          p = s.split(" ")
-          if len(p) != 5 or len(p[4]) % 2:
-            continue
-          t = int(p[1])
-          if profile is not None or tap is not None:
-            fr = (t, int(p[2]), int(p[3], 16), bytes.fromhex(p[4]))
-            if profile is not None:
-              profile.add(*fr)
-            if tap is not None:
-              tap(*fr)
-          else:
-            fr = None
-          if windows is not None:
-            i = bisect.bisect_right(windows, (t, float("inf"))) - 1
-            if i < 0 or windows[i][1] < t:
-              continue
-          frames.append(fr or (t, int(p[2]), int(p[3], 16), bytes.fromhex(p[4])))
-        elif s[0] == "M":
-          p = s.split(" ", 2)
-          markers.append({"t": int(p[1]), "text": p[2] if len(p) > 2 else ""})
-        elif s.startswith("# canlog") and not header:
-          header = _parse_header(s)
-      except (ValueError, IndexError):
+  windows = _merge_windows(windows)
+  lastx: dict[tuple[bytes, bytes], tuple] = {}  # (bus, addr) -> (hex, slot lo, slot hi, _Id): repeats of the same payload in the same state period
+  bnds = sorted({x for p in profile.periods for x in p[:2]}) if profile is not None else []
+  unhex = binascii.unhexlify
+  acache: dict[bytes, int] = {}
+  dcache: dict[bytes, bytes] = {}
+  lt = -1
+  for blk, tail in _chunks(path, progress):
+    _scan_meta(blk, header, markers)
+    if tail:
+      continue  # unterminated last line: markers count, frames do not
+    for t, bus, a, h in _FRAME_RX.findall(blk):  # (gc is off for the whole scan, see read_log)
+      if len(h) & 1:
         continue
+      ti = int(t)
+      fr = None
+      if tap is not None or profile is not None:
+        if tap is None:
+          k = (bus, a)
+          e = lastx.get(k)
+          if e is not None and e[0] == h and e[1] <= ti < e[2]:
+            e[3].n += 1  # exactly what Profile.add does for a repeat of the previous payload in the same period
+            e[3].last_t = ti
+          else:
+            fr = (ti, int(bus), int(a, 16), unhex(h))
+            profile.add(*fr)  # type: ignore[union-attr]
+            j = bisect.bisect_right(bnds, ti)
+            lastx[k] = (h, bnds[j - 1] if j else -1, bnds[j] if j < len(bnds) else 2 ** 63, profile.ids[(fr[1], fr[2])])  # type: ignore[union-attr]
+        else:
+          fr = (ti, int(bus), int(a, 16), unhex(h))
+          if profile is not None:
+            profile.add(*fr)
+          tap(*fr)
+      if windows is not None:
+        i = bisect.bisect_right(windows, (ti, float("inf"))) - 1
+        if i < 0 or windows[i][1] < ti:
+          continue
+      # kept frames share their timestamp / address / payload objects (a window can hold a million of them)
+      if ti != lt:
+        lt = ti
+      ac = acache.get(a)
+      if ac is None:
+        ac = acache[a] = int(a, 16)
+      d = dcache.get(h)
+      if d is None:
+        d = unhex(h)
+        if len(dcache) < 100_000:
+          dcache[h] = d
+      frames.append((lt, int(bus), ac, d))
   return header, frames, markers
 
 
@@ -127,12 +214,14 @@ CYCLE_MIN_RATE_HZ = 0.2
 NOISE_MIN_DISTINCT = 8
 
 
+_HX = [f"{b:02X}" for b in range(256)]
+
+
 def _hx(b: int) -> str:
-  return f"{b:02X}"
+  return _HX[b]
 
 
-def _pop(x: int) -> int:
-  return bin(x).count("1")
+_pop = int.bit_count
 
 
 def _vals(mask: int) -> list[str]:
@@ -296,24 +385,109 @@ class Profile:
           per[(p, k0, i)] = per.get((p, k0, i), 0) | 1 << data[i]
     s.lab = p
 
+  @staticmethod
+  def _judge(s: _Id) -> None:
+    nb0 = _pop(s.vals[0]) if s.vals else 0
+    dur = max(s.last_t - s.first_t, 1) / 1e9
+    busy = s.changes >= CYCLE_MIN_CHANGES and s.changes / dur >= CYCLE_MIN_RATE_HZ
+    s.mux = busy and s.hist is not None and 2 <= nb0 <= MUX_MAX and s.b0_changes >= 0.5 * (s.n - 1)
+    s.cyclic = s.mux or (busy and s.payloads is not None and s.revisits >= max(3, 0.3 * s.changes))
+    s.period = _find_period(s.seq) if (s.cyclic and s.seq) else 0
+    s.bad = {0: "mux"} if s.mux else {}
+    if s.mux:
+      return  # other bytes are judged per mux value via the first-seen history
+    for i, c in enumerate(s.ch):
+      if c >= COUNTER_MIN_CHANGES and max(s.pos[i], s.neg[i]) >= 0.9 * c:
+        s.bad[i] = "counter"
+      elif c >= COUNTER_MIN_CHANGES and c >= 0.3 * (s.n - 1) and _pop(s.vals[i]) >= NOISE_MIN_DISTINCT:
+        s.bad[i] = "noise"
+
   def finalize(self) -> "Profile":
     for s in self.ids.values():
-      nb0 = _pop(s.vals[0]) if s.vals else 0
-      dur = max(s.last_t - s.first_t, 1) / 1e9
-      busy = s.changes >= CYCLE_MIN_CHANGES and s.changes / dur >= CYCLE_MIN_RATE_HZ
-      s.mux = busy and s.hist is not None and 2 <= nb0 <= MUX_MAX and s.b0_changes >= 0.5 * (s.n - 1)
-      s.cyclic = s.mux or (busy and s.payloads is not None and s.revisits >= max(3, 0.3 * s.changes))
-      s.period = _find_period(s.seq) if (s.cyclic and s.seq) else 0
-      s.bad = {0: "mux"} if s.mux else {}
-      if s.mux:
-        continue  # other bytes are judged per mux value via the first-seen history
-      for i, c in enumerate(s.ch):
-        if c >= COUNTER_MIN_CHANGES and max(s.pos[i], s.neg[i]) >= 0.9 * c:
-          s.bad[i] = "counter"
-        elif c >= COUNTER_MIN_CHANGES and c >= 0.3 * (s.n - 1) and _pop(s.vals[i]) >= NOISE_MIN_DISTINCT:
-          s.bad[i] = "noise"
+      self._judge(s)
     self.final = True
     return self
+
+  def add_series(self, bus: int, addr: int, ts: "array[int]", raw: bytes, length: int) -> None:
+    """Fold all frames of one (bus, addr) in one go: `ts` ascending, `raw` = their payloads back to back, every
+    payload `length` (>0) bytes. Column-wise (C-speed) instead of frame by frame. Gives the same per-byte statistics
+    as add() for the same frames (value sets, change/direction counts, counter/noise/mux/cyclic verdicts and per
+    state-period value sets) but keeps no payload-history tables (no first-seen times, no change sequence), so it
+    is for the verdict, not for diff_around_markers."""
+    n = len(ts)
+    s = self.ids[(bus, addr)] = _Id(ts[0])
+    s.n = n
+    s.last_t = ts[-1]
+    s.seq = None
+    cols = [raw[i::length] for i in range(length)]
+    s.ch, s.pos, s.neg, s.vals = [0] * length, [0] * length, [0] * length, [0] * length
+    varying = []
+    for i, col in enumerate(cols):
+      if col.count(col[0]) == n:
+        s.vals[i] = _POW[col[0]]
+        continue
+      varying.append(i)
+      s.vals[i] = sum(map(_POW.__getitem__, set(col)))
+      d = Counter(map(operator.sub, col[1:], col))
+      d.pop(0, None)
+      ch = sum(d.values())
+      pos = sum(c for k, c in d.items() if (k & 0xFF) < 0x80)
+      s.ch[i], s.pos[i], s.neg[i] = ch, pos, ch - pos
+    s.b0_changes = s.ch[0]
+    pl: dict[bytes, int] | None = {}
+    if varying:
+      rows = [raw[j:j + length] for j in range(0, n * length, length)]
+      s.changes = sum(map(operator.ne, rows, rows[1:]))
+      prev = None
+      for r, t in zip(rows, ts, strict=True):
+        if r == prev:
+          continue
+        prev = r
+        if r in pl:
+          s.revisits += 1
+        elif len(pl) < PAYLOAD_CAP:
+          pl[r] = t
+        else:
+          pl = None
+          break
+    else:
+      pl[raw[:length]] = ts[0]
+    s.payloads = pl
+    # hist only matters as "alive" (mux needs it): it dies past MUX_MAX byte-0 values or HIST_CAP first-seen entries
+    nb0 = _pop(s.vals[0])
+    dur = max(s.last_t - s.first_t, 1) / 1e9
+    s.hist = {} if nb0 <= MUX_MAX else None
+    if (s.hist is not None and 2 <= nb0 and s.changes >= CYCLE_MIN_CHANGES and s.changes / dur >= CYCLE_MIN_RATE_HZ
+        and s.b0_changes >= 0.5 * (n - 1)):
+      trip = 0
+      for col in cols:
+        trip += len(set(zip(cols[0], col)))
+        if trip > HIST_CAP:
+          s.hist = None
+          break
+    self._judge(s)
+    if not self.periods:
+      return
+    rngs = []
+    for p, (a, b, _) in enumerate(self.periods):
+      lo, hi = bisect.bisect_left(ts, a), bisect.bisect_left(ts, b)
+      if lo < hi:
+        rngs.append((p, lo, hi))
+    per = s.per
+    if not s.mux:
+      for i in varying:  # a byte that never varies cannot separate ON from OFF
+        if i not in s.bad:
+          col = cols[i]
+          for p, lo, hi in rngs:
+            per[(p, -1, i)] = sum(map(_POW.__getitem__, set(col[lo:hi])))
+    else:
+      c0 = cols[0]
+      for i in varying:
+        if i:
+          col = cols[i]
+          for p, lo, hi in rngs:
+            for k, v in set(zip(c0[lo:hi], col[lo:hi])):
+              per[(p, k, i)] = per.get((p, k, i), 0) | _POW[v]
 
   def get(self, bus: int, addr: int) -> _Id | None:
     return self.ids.get((bus, addr))
@@ -511,7 +685,7 @@ def state_candidates(frames: list[Frame], markers: list[dict], on_text: str = "C
                 "score": 10 * (n_on + n_off) - 3 * spread - 2 * (per_key[key] - 1) + (50 if addr in WATCH else 0)})
       out.append(c)
   out = [c for c in out if c["score"] > 0]
-  out.sort(key=lambda c: (-c["score"], c["bus"], c["addr"], c["i"]))
+  out.sort(key=lambda c: (-c["score"], c["bus"], c["addr"], c["i"], c["mux"] or ""))
   return out[:limit]
 
 
@@ -563,7 +737,7 @@ def step_candidates(frames: list[Frame], markers: list[dict], up_text: str = "Te
               "matched": len(ds), "steps": len(steps),
               "score": 10 * len(ds) + (20 if both else 0) - 5 * (len(steps) - len(ds)) + (50 if addr in WATCH else 0)})
     out.append(c)
-  out.sort(key=lambda c: (-c["score"], c["bus"], c["addr"], c["i"]))
+  out.sort(key=lambda c: (-c["score"], c["bus"], c["addr"], c["i"], c["mux"] or ""))
   return out[:limit]
 
 
@@ -636,29 +810,29 @@ def _event_result(tr: _BitTrack, t: int, key: str, expect: int | None, win_s: fl
   return r
 
 
-def verdict(path: str, settle_s: float = 2.0) -> dict:
-  """Plain-language verdict of a guided test. Streams the log once (candidate bits, bus counts, whole-log profile,
-  frames near markers only) so a 500 MB log stays cheap in memory."""
-  _, raw_markers = read_markers(path)
-  markers = effective_markers(raw_markers)
-  cand_addrs = {c["addr"] for c in STATUS_CANDIDATES}
-  tracks: dict[tuple[int, int], _BitTrack] = {}
-  bus_frames: dict[int, int] = defaultdict(int)
-  bus_ids: dict[int, set[int]] = defaultdict(set)
-  span: list[int | None] = [None, None]
+class _Tracker:
+  """What the verdict reads off the frames: candidate status bits over time, frame/id counts per bus, log span."""
 
-  def tap(t: int, bus: int, addr: int, data: bytes) -> None:
-    bus_frames[bus] += 1
-    bus_ids[bus].add(addr)
-    if span[0] is None or t < span[0]:
-      span[0] = t
-    if span[1] is None or t > span[1]:
-      span[1] = t
-    if addr not in cand_addrs:
-      return
-    tr = tracks.get((bus, addr))
+  def __init__(self) -> None:
+    self.tracks: dict[tuple[int, int], _BitTrack] = {}
+    self.bus_frames: dict[int, int] = defaultdict(int)
+    self.bus_ids: dict[int, set[int]] = defaultdict(set)
+    self.span: list[int | None] = [None, None]
+    self.cand_addrs = {c["addr"] for c in STATUS_CANDIDATES}
+
+  def stat(self, t: int, bus: int, addr: int) -> None:
+    self.bus_frames[bus] += 1
+    self.bus_ids[bus].add(addr)
+    sp = self.span
+    if sp[0] is None or t < sp[0]:
+      sp[0] = t
+    if sp[1] is None or t > sp[1]:
+      sp[1] = t
+
+  def cand(self, t: int, bus: int, addr: int, data: bytes) -> None:
+    tr = self.tracks.get((bus, addr))
     if tr is None:
-      tr = tracks[(bus, addr)] = _BitTrack()
+      tr = self.tracks[(bus, addr)] = _BitTrack()
     tr.n += 1
     if tr.segs and t - tr.segs[-1][1] < GAP_NS:
       tr.segs[-1][1] = t
@@ -673,12 +847,133 @@ def verdict(path: str, settle_s: float = 2.0) -> dict:
             tr.changes.append((t, b))
         break
 
+  def tap(self, t: int, bus: int, addr: int, data: bytes) -> None:
+    self.stat(t, bus, addr)
+    if addr in self.cand_addrs:
+      self.cand(t, bus, addr, data)
+
+
+def _step_windows(markers: list[dict], up_text: str = "Temp up", down_text: str = "Temp down",
+                  pre_s: float = 3.0, post_s: float = 3.0) -> list[tuple[int, int]]:
+  """[(t0, t1)): the frames step_candidates reads for each Temp up/down marker."""
+  mts = sorted(m["t"] for m in markers)
+  out = []
+  for m in markers:
+    if _match(m.get("text", ""), up_text) or _match(m.get("text", ""), down_text):
+      j = bisect.bisect_right(mts, m["t"])
+      out.append((m["t"] - int(pre_s * 1e9), min(m["t"] + int(post_s * 1e9), mts[j] if j < len(mts) else 2 ** 63)))
+  return out
+
+
+def verdict_exact(path: str, settle_s: float = 2.0, progress: Progress | None = None) -> dict:
+  """Reference implementation of verdict(): the whole-log Profile, frame by frame. Slow (minutes on a 200 MB log on
+  the comma); kept to cross-check verdict()."""
+  _, raw_markers = read_markers(path)
+  markers = effective_markers(raw_markers)
+  tk = _Tracker()
   prof = Profile(markers, "Climate ON", "Climate OFF", settle_s, log_end(path))
   span_ns = int(10.0 * 1e9)
   windows = [(m["t"] - span_ns, m["t"] + 3 * 10 ** 9) for m in markers]
-  header, frames, _ = read_log(path, windows=windows if windows else [(0, 0)], profile=prof, tap=tap)
+  header, frames, _ = read_log(path, windows=windows if windows else [(0, 0)], profile=prof, tap=tk.tap, progress=progress)
   prof.finalize()
-  base = header["mono_ns"] if isinstance(header.get("mono_ns"), int) else (span[0] or 0)
+  return _verdict_report(header, markers, tk, frames, prof)
+
+
+def verdict(path: str, settle_s: float = 2.0, progress: Progress | None = None, buses: set[int] | None = None) -> dict:
+  """Plain-language verdict of a guided test, in one fast pass over the log.
+
+  Everything the verdict needs is read with C-speed regex scans: the candidate status bits over the whole log, frame
+  and id counts per bus, and, for the state/step candidates, only the frames inside the settled ON/OFF periods and
+  the Temp up/down windows (about 40 % of a typical log), which are folded column-wise into the Profile.
+  Differences from verdict_exact(): the counter/noise/mux judgement of a byte uses those frames instead of the whole
+  log, and the log span is taken from the first and last frame of each 4 MB block (frames are time-ordered).
+  `buses` limits the state/step search to those buses (counts and candidates still see every bus).
+  `progress(bytes_read, file_size)` is called after every 4 MB block."""
+  with _no_gc():
+    return _verdict(path, settle_s, progress, buses)
+
+
+def _verdict(path: str, settle_s: float, progress: Progress | None, buses: set[int] | None) -> dict:
+  header, raw_markers = read_markers(path)
+  markers = effective_markers(raw_markers)
+  tk = _Tracker()
+  prof = Profile(markers, "Climate ON", "Climate OFF", settle_s, log_end(path))
+  swin = _step_windows(markers)
+  ranges: list[list[int]] = []
+  for a, b in sorted([(p[0], p[1]) for p in prof.periods] + swin):
+    if ranges and a <= ranges[-1][1]:
+      ranges[-1][1] = max(ranges[-1][1], b)
+    else:
+      ranges.append([a, b])
+  cand_hex = {f"{c['addr']:08{x}}".encode() for c in STATUS_CANDIDATES for x in "Xx"}
+  bsel = {str(b).encode() for b in buses} if buses is not None else None
+  unhex = binascii.unhexlify
+  t_of = lambda r: int(r[0])  # noqa: E731
+  series: dict[tuple[bytes, bytes], list] = {}  # (bus, addr) -> [ts, payload bytes back to back, hex length, irregular rows]
+  bc: Counter = Counter()
+  ids: set[tuple[bytes, bytes]] = set()
+  sp0 = sp1 = None
+  for blk, tail in _chunks(path, progress):
+    if tail:
+      continue
+    rows = _FRAME_RX.findall(blk)
+    if not rows:
+      continue
+    bc.update(map(_g1, rows))
+    ids.update(map(_g12, rows))
+    t0, t1 = int(rows[0][0]), int(rows[-1][0])
+    sp0, sp1 = (t0 if sp0 is None else min(sp0, t0)), (t1 if sp1 is None else max(sp1, t1))
+    for r in [r for r in rows if r[2] in cand_hex and not len(r[3]) & 1]:
+      tk.cand(int(r[0]), int(r[1]), int(r[2], 16), unhex(r[3]))
+    for a, b in ranges:
+      if b <= t0 or a > t1:
+        continue
+      for t, bus, ad, h in rows[bisect.bisect_left(rows, a, key=t_of):bisect.bisect_left(rows, b, key=t_of)]:
+        if len(h) & 1 or (bsel is not None and bus not in bsel):
+          continue
+        s = series.get((bus, ad))
+        if s is None:
+          s = series[(bus, ad)] = [array("q"), bytearray(), len(h), [] if not h else None]
+        if s[3] is None and len(h) != s[2]:  # payload length changed: keep this id as plain rows
+          n = s[2] // 2
+          s[3] = [(s[0][j], bytes(s[1][j * n:(j + 1) * n])) for j in range(len(s[0]))]
+        if s[3] is not None:
+          s[3].append((int(t), unhex(h)))
+        else:
+          s[0].append(int(t))
+          s[1] += unhex(h)
+  for b, n in bc.items():
+    tk.bus_frames[int(b)] += n
+  for b, ad in ids:
+    tk.bus_ids[int(b)].add(int(ad, 16))
+  tk.span = [sp0, sp1]
+  frames: list[Frame] = []
+  for (bus, ad), (ts, raw, hl, rows_) in series.items():
+    bi, ai = int(bus), int(ad, 16)
+    if rows_ is None and any(map(operator.gt, ts, ts[1:])):  # not time-ordered: replay it exactly
+      n = hl // 2
+      rows_ = [(ts[j], bytes(raw[j * n:(j + 1) * n])) for j in range(len(ts))]
+    if rows_ is not None:
+      for t, d in rows_:
+        prof.add(t, bi, ai, d)
+      pairs = rows_
+    else:
+      n = hl // 2
+      prof.add_series(bi, ai, ts, bytes(raw), n)
+      pairs = None
+    for a, b in swin:
+      if pairs is not None:
+        frames += [(t, bi, ai, d) for t, d in pairs if a <= t < b]
+      else:
+        frames += [(ts[j], bi, ai, bytes(raw[j * n:(j + 1) * n]))
+                   for j in range(bisect.bisect_left(ts, a), bisect.bisect_left(ts, b))]
+  series.clear()
+  prof.finalize()
+  return _verdict_report(header, markers, tk, frames, prof)
+
+
+def _verdict_report(header: dict, markers: list[dict], tk: _Tracker, frames: list[Frame], prof: Profile) -> dict:
+  base = header["mono_ns"] if isinstance(header.get("mono_ns"), int) else (tk.span[0] or 0)
   notes: list[str] = []
 
   evs = []  # (marker, key, expect, win, label)
@@ -693,10 +988,10 @@ def verdict(path: str, settle_s: float = 2.0) -> dict:
 
   cands = []
   for c in STATUS_CANDIDATES:
-    tr = tracks.get((c["bus"], c["addr"]))
+    tr = tk.tracks.get((c["bus"], c["addr"]))
     where = f"bus {c['bus']}"
     if tr is None:
-      alt = sorted(((t.n, b) for (b, a), t in tracks.items() if a == c["addr"]), reverse=True)
+      alt = sorted(((t.n, b) for (b, a), t in tk.tracks.items() if a == c["addr"]), reverse=True)
       if alt:
         notes.append(f"{c['label']}: seen on bus {alt[0][1]} instead of bus {c['bus']}; its bit was not judged.")
         where = f"bus {c['bus']} (only seen on bus {alt[0][1]})"
@@ -739,8 +1034,8 @@ def verdict(path: str, settle_s: float = 2.0) -> dict:
   states = state_candidates(frames, markers, profile=prof, limit=5)
   steps = step_candidates(frames, markers, profile=prof, limit=5)
   return {"header": header, "candidates": cands, "markers": len(markers), "marker_list": mk,
-          "buses": {str(b): {"frames": bus_frames[b], "ids": len(bus_ids[b])} for b in sorted(bus_frames)},
-          "log_seconds": round(((span[1] or 0) - (span[0] or 0)) / 1e9, 1), "states": states, "steps": steps, "notes": notes}
+          "buses": {str(b): {"frames": tk.bus_frames[b], "ids": len(tk.bus_ids[b])} for b in sorted(tk.bus_frames)},
+          "log_seconds": round(((tk.span[1] or 0) - (tk.span[0] or 0)) / 1e9, 1), "states": states, "steps": steps, "notes": notes}
 
 
 def format_states_text(states: list[dict], steps: list[dict]) -> str:
