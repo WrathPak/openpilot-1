@@ -239,3 +239,83 @@ def test_analyze_file_and_cli_states(tmp_path, capsys):
   assert out["states"][0]["addr"] == 0x300 and out["steps"] and out["profile"]["mux"] == 1
   assert analyze.main([str(p), "--states", "--diff"]) == 0
   assert "State candidates" in capsys.readouterr().out
+
+
+def test_decode_climate_candidates():
+  assert dec.decode(0x3B5, bytes([0x80, 0, 0, 0]))["climate_on_candidate"] is True
+  assert dec.decode(0x3B5, bytes([0x7F, 0, 0, 0]))["climate_on_candidate"] is False
+  assert dec.decode(0x3B5, b"") == {"raw": ""}
+  d = dec.decode(0x668, bytes([0, 0, 0, 0x2A, 0, 0, 0, 0x10]))
+  assert d["climate_on_candidate"] is True and d["b3"] == 0x2A and d["raw"] == "0000002A00000010"
+  assert dec.decode(0x668, bytes([0, 0, 0, 0, 0, 0, 0, 0xEF]))["climate_on_candidate"] is False
+  short = dec.decode(0x668, bytes([1, 2, 3]))  # no byte 7 / byte 3 guard
+  assert "climate_on_candidate" not in short and "b3" not in short or short.get("b3") == 3
+  assert dec.decode(0x668, b"\x01\x02") == {"raw": "0102"}
+  assert {0x3B5, 0x668} <= set(dec.WATCH) and "candidate" in dec.WATCH[0x3B5]
+
+
+def _guided_log(path, end_s=160, remote=True):
+  """0x3B5 bus 1 bit 7 follows numbered Climate ON/OFF markers 0.9 s late; 0x668 bus 0 never moves."""
+  marks = [(f"Climate ON #{i + 1}", 10 + 40 * i) for i in range(3)] + [(f"Climate OFF #{i + 1}", 30 + 40 * i) for i in range(3)]
+  marks += [] if not remote else [("Remote START sent", 130), ("Remote START confirmed", 142), ("Climate ON #9", 150), ("UNDO previous", 151)]
+  lines = ["# canlog v1 started=2026-01-01T00:00:00 mono_ns=0 device=t"]
+  lines += [f"M {int(t * S)} {txt}" for txt, t in marks]
+  for k in range(end_s * 10):
+    t = k / 10
+    on = any(10 + 40 * i + 0.9 <= t < 30 + 40 * i + 0.9 for i in range(3)) or (remote and t >= 138)
+    lines.append(f"F {int(t * S)} 1 000003B5 {0x80 if on else 0:02X}00000000000000")
+    lines.append(f"F {int(t * S)} 0 00000668 0000000000000000")
+    lines.append(f"F {int(t * S)} 0 00000300 1122{5 if on else 0:02X}33")
+  lines.sort(key=lambda s: int(s.split(" ")[1]) if s[0] in "FM" else -1)
+  path.write_text("\n".join(lines) + "\n")
+  return path
+
+
+def test_verdict_synthetic(tmp_path):
+  p = _guided_log(tmp_path / "g.canlog")
+  v = analyze.verdict(str(p))
+  c = {x["addr"]: x for x in v["candidates"]}
+  a = c[0x3B5]
+  assert a["level"] == "green" and a["groups"]["on"]["matched"] == 3 and a["groups"]["on"]["total"] == 3
+  assert a["groups"]["off"]["matched"] == 3 and a["groups"]["rstart"]["matched"] == 1
+  assert "matched 3 of 3 ON and 3 of 3 OFF" in a["summary"] and "very likely" in a["summary"]
+  assert all(abs(e["flip_s"] - 0.9) < 0.11 for e in a["events"] if e["key"] in ("on", "off"))
+  rs = next(e for e in a["events"] if e["key"] == "rstart")
+  assert rs["ok"] and abs(rs["flip_s"] - 8.0) < 0.11
+  assert not any("confirmed" in e["text"] or "#9" in e["text"] for e in a["events"])  # confirmed ignored, undone marker dropped
+  b = c[0x668]
+  assert b["level"] == "red" and b["groups"]["on"]["matched"] == 0
+  assert v["buses"]["1"]["frames"] == 160 * 10 and v["buses"]["0"]["ids"] == 2
+  assert v["markers"] == 8 and v["log_seconds"] > 150
+  v2 = analyze.verdict(str(_guided_log(tmp_path / "g2.canlog", remote=False)))  # no remote ON inside the last OFF period
+  assert v2["states"] and v2["states"][0]["addr"] in (0x3B5, 0x300) and len(v2["states"]) <= 5
+
+
+def test_verdict_no_data_and_wrong_bus(tmp_path):
+  p = tmp_path / "e.canlog"
+  p.write_text("# canlog v1 started=x mono_ns=0 device=t\nM 1000000000 Climate ON #1\nF 1000000000 2 000003B5 8000000000000000\n")
+  v = analyze.verdict(str(p))
+  a = next(x for x in v["candidates"] if x["addr"] == 0x3B5)
+  assert a["level"] == "red" and "never seen on bus 1" in a["summary"] and v["notes"]
+  assert next(x for x in v["candidates"] if x["addr"] == 0x668)["level"] == "red"
+
+
+def test_numbered_markers_prefix_match(tmp_path):
+  p = _real_log(tmp_path / "r.canlog")
+  n: dict[str, int] = {}
+  out = []
+  for ln in p.read_text().splitlines():
+    if ln.startswith("M "):
+      head, _, text = ln.partition(" ")[2].partition(" ")
+      n[text] = n.get(text, 0) + 1
+      ln = f"M {head} {text} #{n[text]}"
+    out.append(ln)
+  txt = "\n".join(out) + "\n"
+  assert "Climate ON #2" in txt and "Temp down #2" in txt
+  p.write_text(txt)
+  _, frames, markers = analyze.read_log(str(p))
+  states = analyze.state_candidates(frames, markers)
+  assert states and (states[0]["addr"], states[0]["i"]) == (0x300, 2) and states[0]["on_periods"] == 2
+  steps = analyze.step_candidates(frames, markers)
+  assert steps[0]["addr"] == 0x16A954FB and steps[0]["matched"] == 4
+  assert len(analyze.state_periods(markers)) == 4

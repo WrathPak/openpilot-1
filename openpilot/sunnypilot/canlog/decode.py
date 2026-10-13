@@ -8,6 +8,8 @@ WATCH: dict[int, str] = {
   0x16A954FB: "Climate setpoint / heating state",
   0x16A95493: "Heating active",
   0x1B000010: "NMH_Gateway (gateway network management)",
+  0x3B5: "Climate status? (candidate)",
+  0x668: "Climate status 2? (candidate)",
 }
 
 NMH_ADDR = 0x1B000010
@@ -116,6 +118,16 @@ def decode(addr: int, data: bytes) -> dict[str, object]:
     elif addr == 0x16A95493:
       if len(data) >= 1:
         out["heating_active"] = data[0] == 0x01
+      out["raw"] = data.hex().upper()
+    elif addr == 0x3B5:
+      if len(data) >= 1:
+        out["climate_on_candidate"] = bool(data[0] & 0x80)
+      out["raw"] = data.hex().upper()
+    elif addr == 0x668:
+      if len(data) >= 8:
+        out["climate_on_candidate"] = bool(data[7] & 0x10)
+      if len(data) >= 4:
+        out["b3"] = data[3]
       out["raw"] = data.hex().upper()
     elif addr == NMH_ADDR:
       out.update(decode_signals(data, _nmh_table()))

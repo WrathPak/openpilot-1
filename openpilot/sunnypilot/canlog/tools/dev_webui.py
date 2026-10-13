@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from openpilot.sunnypilot.canlog import webui
+from openpilot.sunnypilot.canlog.decode import decode, fmt_addr
 
 IDS = {0x16A954FB: "Climate setpoint", 0x16A95493: "Heating active", 0x1B000010: "NMH_Gateway"}
 
@@ -56,9 +57,16 @@ class FakeRecorder:
     out: dict[str, Any] = {}
     for a in IDS:
       flip = int(now * 2) % 2
-      out["0x%X" % a] = {str(b): {"t": int(now * 1e9), "age_s": random.random() * 0.2, "count": int(now) % 100000,
+      out[fmt_addr(a)] = {str(b): {"t": int(now * 1e9), "age_s": random.random() * 0.2, "count": int(now) % 100000,
                                    "data": bytes([int(now) % 256, 0x31 if flip else 0x30, 0, 1, 2, 3, 4, 5]).hex().upper(),
                                    "decoded": {"setpoint": "%.1f C" % (20 + int(now) % 5)}} for b in (0, 2)}
+    on = (int(now) // 10) % 2 == 1  # climate status candidate toggles every 10 s
+    d3b5 = bytes([0x80 if on else 0x00, 1, 2, 3, 4, 5, 6, 7])
+    out[fmt_addr(0x3B5)] = {"1": {"t": int(now * 1e9), "age_s": random.random() * 0.2, "count": int(now * 50) % 100000,
+                                  "data": d3b5.hex().upper(), "decoded": decode(0x3B5, d3b5)}}
+    d668 = bytes([0, 0, 0, int(now) % 256, 0, 0, 0, 0x10 if on else 0x00])[:8]
+    out[fmt_addr(0x668)] = {"0": {"t": int(now * 1e9), "age_s": random.random() * 0.2, "count": int(now * 10) % 100000,
+                                  "data": d668.hex().upper(), "decoded": decode(0x668, d668)}}
     return out
 
   def list_sessions(self) -> list[dict]:

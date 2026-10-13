@@ -114,3 +114,27 @@ def test_diff_states(srv, tmp_path):
   assert d["steps"][0]["addr"] == 0x16A954FB and d["profile"]["mux"] == 1
   assert call(op, base, "/api/diff?session=r&settle=x")[0] == 400
   assert b"stateCards" in call(op, base, "/")[1]
+
+
+def test_verdict_api(srv, tmp_path):
+  from openpilot.sunnypilot.canlog.tests.test_canlog import _guided_log
+  _, base, _ = srv
+  _guided_log(tmp_path / "g.canlog")
+  op = client()
+  assert call(op, base, "/api/verdict?session=g")[0] == 401
+  call(op, base, "/api/setpin", {"pin": "1234", "pin2": "1234"})
+  v = js(call(op, base, "/api/verdict?session=g"))
+  assert v["session"] == "g" and v["candidates"][0]["level"] == "green" and v["markers"] == 8
+  assert js(call(op, base, "/api/verdict"))["session"] == "g"  # latest
+  assert call(op, base, "/api/verdict?session=nope")[0] == 404
+  page = call(op, base, "/")[1]
+  assert b"data-t=\"test\"" in page and b"showVerdict" in page and b"wakeLock" in page and b"Manual mode" in page
+
+
+def test_live_has_climate_candidate(srv):
+  _, base, _ = srv
+  op = client()
+  call(op, base, "/api/setpin", {"pin": "1234", "pin2": "1234"})
+  live = js(call(op, base, "/api/live"))
+  assert "climate_on_candidate" in live["0x000003B5"]["1"]["decoded"]
+  assert live["names"]["0x000003B5"].startswith("Climate status")

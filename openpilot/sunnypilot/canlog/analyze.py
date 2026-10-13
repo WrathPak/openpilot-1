@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 
 from openpilot.sunnypilot.canlog import config
 from openpilot.sunnypilot.canlog.decode import WATCH, decode, fmt_addr, parse_addr
@@ -60,9 +61,10 @@ def log_end(path: str) -> int | None:
 
 
 def read_log(path: str, windows: list[tuple[int, int]] | None = None,
-             profile: "Profile | None" = None) -> tuple[dict, list[Frame], list[dict]]:
+             profile: "Profile | None" = None, tap: Callable[[int, int, int, bytes], None] | None = None
+             ) -> tuple[dict, list[Frame], list[dict]]:
   """Stream-parse a .canlog. `windows` = [(t0, t1), ...] in mono ns keeps only frames inside any window.
-  `profile`, if given, sees every frame of the log (windowed or not)."""
+  `profile` and `tap` (a callable(t, bus, addr, data)), if given, see every frame of the log (windowed or not)."""
   header: dict = {}
   frames: list[Frame] = []
   markers: list[dict] = []
@@ -90,9 +92,12 @@ def read_log(path: str, windows: list[tuple[int, int]] | None = None,
           if len(p) != 5 or len(p[4]) % 2:
             continue
           t = int(p[1])
-          if profile is not None:
+          if profile is not None or tap is not None:
             fr = (t, int(p[2]), int(p[3], 16), bytes.fromhex(p[4]))
-            profile.add(*fr)
+            if profile is not None:
+              profile.add(*fr)
+            if tap is not None:
+              tap(*fr)
           else:
             fr = None
           if windows is not None:
@@ -560,6 +565,182 @@ def step_candidates(frames: list[Frame], markers: list[dict], up_text: str = "Te
     out.append(c)
   out.sort(key=lambda c: (-c["score"], c["bus"], c["addr"], c["i"]))
   return out[:limit]
+
+
+# ---------------------------------------------------------------- verdict (guided tests)
+# Candidate "climate status" bits: (bus, addr, byte, mask). Add rows here to judge more candidates.
+STATUS_CANDIDATES: list[dict] = [
+  {"addr": 0x3B5, "bus": 1, "byte": 0, "mask": 0x80, "label": "0x3B5 byte 0 bit 7"},
+  {"addr": 0x668, "bus": 0, "byte": 7, "mask": 0x10, "label": "0x668 byte 7 bit 4"},
+]
+# (marker prefix, key, expected bit state or None, window seconds after the marker, label)
+VERDICT_EVENTS: list[tuple[str, str, int | None, float, str]] = [
+  ("Climate ON", "on", 1, 10.0, "ON"), ("Climate OFF", "off", 0, 10.0, "OFF"),
+  ("Remote START", "rstart", 1, 120.0, "remote START"), ("Remote STOP", "rstop", 0, 120.0, "remote STOP"),
+  ("Fob unlock", "fob", None, 60.0, "fob unlock"),
+]
+VERDICT_PRE_S = 2.0
+VERDICT_CHECK_S = 3.0
+GAP_NS = 1_000_000_000
+
+
+def effective_markers(markers: list[dict]) -> list[dict]:
+  """Drop markers cancelled by a later "UNDO previous" marker (the log itself is never edited)."""
+  out: list[dict] = []
+  for m in sorted(markers, key=lambda m: m["t"]):
+    if _match(m.get("text", ""), "UNDO"):
+      if out:
+        out.pop()
+    else:
+      out.append(m)
+  return out
+
+
+class _BitTrack:
+  __slots__ = ("changes", "segs", "n", "bit")
+
+  def __init__(self) -> None:
+    self.changes: list[tuple[int, int]] = []  # (t, bit) at every change (and the first frame)
+    self.segs: list[list[int]] = []  # [start, end] runs of frames with gaps < GAP_NS
+    self.n = 0
+    self.bit = -1
+
+
+def _state_at(changes: list[tuple[int, int]], t: int) -> int | None:
+  j = bisect.bisect_right(changes, t, key=lambda e: e[0]) - 1
+  return changes[j][1] if j >= 0 else None
+
+
+def _event_result(tr: _BitTrack, t: int, key: str, expect: int | None, win_s: float, base: int) -> dict:
+  r: dict = {"rel_s": round((t - base) / 1e9, 1), "flip_s": None, "ok": None, "note": ""}
+  lo, hi = t - int(VERDICT_PRE_S * 1e9), t + int(win_s * 1e9)
+  if expect is None:  # wake-up: does this id start talking after the marker?
+    before = any(a <= t and b >= lo for a, b in tr.segs)
+    first = next((a for a, _ in tr.segs if t < a <= hi), None)
+    if first is not None and not before:
+      r["flip_s"] = round((first - t) / 1e9, 1)
+    r["note"] = "already active" if before else ("started talking" if first is not None else "stayed silent")
+    return r
+  button = key in ("on", "off")
+  if button:
+    r["ok"] = _state_at(tr.changes, t + int(VERDICT_CHECK_S * 1e9)) == expect
+  flip = next((ct for ct, b in tr.changes if (lo if button else t) <= ct <= hi and b == expect), None)
+  if flip is not None:
+    r["flip_s"] = round((flip - t) / 1e9, 1)
+  if not button:
+    r["ok"] = flip is not None
+  if not r["ok"]:
+    r["note"] = "no change" if flip is None else "wrong state at +3 s"
+  elif flip is None:
+    r["note"] = "already in that state"
+  return r
+
+
+def verdict(path: str, settle_s: float = 2.0) -> dict:
+  """Plain-language verdict of a guided test. Streams the log once (candidate bits, bus counts, whole-log profile,
+  frames near markers only) so a 500 MB log stays cheap in memory."""
+  _, raw_markers = read_markers(path)
+  markers = effective_markers(raw_markers)
+  cand_addrs = {c["addr"] for c in STATUS_CANDIDATES}
+  tracks: dict[tuple[int, int], _BitTrack] = {}
+  bus_frames: dict[int, int] = defaultdict(int)
+  bus_ids: dict[int, set[int]] = defaultdict(set)
+  span: list[int | None] = [None, None]
+
+  def tap(t: int, bus: int, addr: int, data: bytes) -> None:
+    bus_frames[bus] += 1
+    bus_ids[bus].add(addr)
+    if span[0] is None or t < span[0]:
+      span[0] = t
+    if span[1] is None or t > span[1]:
+      span[1] = t
+    if addr not in cand_addrs:
+      return
+    tr = tracks.get((bus, addr))
+    if tr is None:
+      tr = tracks[(bus, addr)] = _BitTrack()
+    tr.n += 1
+    if tr.segs and t - tr.segs[-1][1] < GAP_NS:
+      tr.segs[-1][1] = t
+    else:
+      tr.segs.append([t, t])
+    for c in STATUS_CANDIDATES:
+      if c["addr"] == addr and c["bus"] == bus:
+        if len(data) > c["byte"]:
+          b = 1 if data[c["byte"]] & c["mask"] else 0
+          if b != tr.bit:
+            tr.bit = b
+            tr.changes.append((t, b))
+        break
+
+  prof = Profile(markers, "Climate ON", "Climate OFF", settle_s, log_end(path))
+  span_ns = int(10.0 * 1e9)
+  windows = [(m["t"] - span_ns, m["t"] + 3 * 10 ** 9) for m in markers]
+  header, frames, _ = read_log(path, windows=windows if windows else [(0, 0)], profile=prof, tap=tap)
+  prof.finalize()
+  base = header["mono_ns"] if isinstance(header.get("mono_ns"), int) else (span[0] or 0)
+  notes: list[str] = []
+
+  evs = []  # (marker, key, expect, win, label)
+  for m in markers:
+    txt = m.get("text", "")
+    for pat, key, expect, win, label in VERDICT_EVENTS:
+      if _match(txt, pat):
+        if key in ("rstart", "rstop") and "confirmed" in txt.casefold():
+          break
+        evs.append((m, key, expect, win, label))
+        break
+
+  cands = []
+  for c in STATUS_CANDIDATES:
+    tr = tracks.get((c["bus"], c["addr"]))
+    where = f"bus {c['bus']}"
+    if tr is None:
+      alt = sorted(((t.n, b) for (b, a), t in tracks.items() if a == c["addr"]), reverse=True)
+      if alt:
+        notes.append(f"{c['label']}: seen on bus {alt[0][1]} instead of bus {c['bus']}; its bit was not judged.")
+        where = f"bus {c['bus']} (only seen on bus {alt[0][1]})"
+    entry: dict = {"addr": c["addr"], "addr_hex": fmt_addr(c["addr"]), "bus": c["bus"], "label": c["label"],
+                   "frames": tr.n if tr else 0, "groups": {}, "events": []}
+    if tr is None or not tr.changes:
+      entry.update(level="red", summary=f"{c['label']}: never seen on {where} - cannot judge it.")
+      cands.append(entry)
+      continue
+    for m, key, expect, win, label in evs:
+      res = _event_result(tr, m["t"], key, expect, win, base)
+      res.update(text=m.get("text", ""), key=key, label=label)
+      entry["events"].append(res)
+      g = entry["groups"].setdefault(key, {"label": label, "total": 0, "matched": 0, "flips": [], "info": expect is None})
+      g["total"] += 1
+      g["matched"] += 1 if res["ok"] else 0
+      if res["flip_s"] is not None:
+        g["flips"].append(res["flip_s"])
+    scored = [g for g in entry["groups"].values() if not g["info"]]
+    total, matched = sum(g["total"] for g in scored), sum(g["matched"] for g in scored)
+    parts = [f"{g['matched']} of {g['total']} {g['label']}" for g in scored]
+    fl = sorted(f for g in scored for f in g["flips"])
+    lat = f", flips about {fl[len(fl) // 2]:.1f} s after the marker" if fl else ""
+    if not scored:
+      lvl, tail = "yellow", "no matching markers in this log, nothing to compare"
+    elif total >= 2 and matched == total:
+      lvl, tail = "green", "very likely the climate status"
+    elif total and matched / total >= 0.6:
+      lvl, tail = "yellow", "partly matches, not conclusive"
+    else:
+      lvl, tail = "red", "does not follow the buttons"
+    info = [f"{g['label']}: {', '.join(e['note'] for e in entry['events'] if e['key'] == k)}"
+            for k, g in entry["groups"].items() if g["info"]]
+    entry.update(level=lvl, matched=matched, total=total,
+                 summary=f"{c['label']}: " + (f"matched {' and '.join(parts)}{lat} - " if parts else "") + tail +
+                 (" (" + "; ".join(info) + ")" if info else ""))
+    cands.append(entry)
+
+  mk = [{"rel_s": round((m["t"] - base) / 1e9, 1), "text": m.get("text", "")} for m in markers]
+  states = state_candidates(frames, markers, profile=prof, limit=5)
+  steps = step_candidates(frames, markers, profile=prof, limit=5)
+  return {"header": header, "candidates": cands, "markers": len(markers), "marker_list": mk,
+          "buses": {str(b): {"frames": bus_frames[b], "ids": len(bus_ids[b])} for b in sorted(bus_frames)},
+          "log_seconds": round(((span[1] or 0) - (span[0] or 0)) / 1e9, 1), "states": states, "steps": steps, "notes": notes}
 
 
 def format_states_text(states: list[dict], steps: list[dict]) -> str:

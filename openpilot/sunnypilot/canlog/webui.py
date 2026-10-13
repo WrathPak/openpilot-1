@@ -175,6 +175,10 @@ def _frame(f: Any) -> tuple[Any, int, int, bytes]:
   return t, int(bus), int(addr), bytes(d)  # type: ignore[arg-type]
 
 
+def _fa(addr: int) -> str:
+  return f"0x{addr:08X}"  # same spelling as decode.fmt_addr (the recorder's /api/live keys)
+
+
 def watched_summary(frames: list, markers: list, watch: dict[int, str], decode_fn: Any, post_ns: int = 3_000_000_000) -> list[dict]:
   idx: dict[tuple[int, int], list[tuple[Any, bytes]]] = {}
   for f in frames:
@@ -199,7 +203,7 @@ def watched_summary(frames: list, markers: list, watch: dict[int, str], decode_f
     for (addr, bus), lst in sorted(idx.items()):
       before = next((p for p in reversed(lst) if p[0] <= mt), None)
       after = next((p for p in reversed(lst) if mt < p[0] <= mt + post_ns), None)  # last frame in this marker's post window
-      out.append({"marker": mi, "id": "0x%X" % addr, "name": watch[addr], "bus": bus,
+      out.append({"marker": mi, "id": _fa(addr), "name": watch[addr], "bus": bus,
                   "before": dec(addr, before), "after": dec(addr, after)})
   return out
 
@@ -368,13 +372,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(409, "Not recording")
     if method == "GET" and path == "/api/live":
       d = dict(rec.latest())
-      d["names"] = {"0x%X" % k: v for k, v in _watch().items()}
+      d["names"] = {_fa(k): v for k, v in _watch().items()}
       d["server_time"] = time.time()
       return self._json(d)
     if method == "GET" and path == "/api/sessions":
       return self._json(rec.list_sessions())
     if method == "GET" and path == "/api/diff":
       return self._diff(q)
+    if method == "GET" and path == "/api/verdict":
+      return self._verdict(q)
     m = re.fullmatch(r"/api/sessions/([^/]+)", path)
     if method == "DELETE" and m:
       name = unquote(m.group(1))
@@ -388,17 +394,35 @@ class Handler(BaseHTTPRequestHandler):
       return self._json({"ok": True})
     self._err(404, "not found")
 
-  def _diff(self, q: dict[str, str]) -> None:
+  def _session(self, q: dict[str, str]) -> tuple[str, str] | None:
     rec = self.ctx.rec
     name = q.get("session", "latest")
     if name == "latest":
       ss = rec.list_sessions()
       if not ss:
-        return self._err(404, "no sessions")
+        self._err(404, "no sessions")
+        return None
       name = ss[0]["name"]
     p = rec.session_path(name)
     if not p:
-      return self._err(404, "unknown session")
+      self._err(404, "unknown session")
+      return None
+    return name, p
+
+  def _verdict(self, q: dict[str, str]) -> None:
+    sp = self._session(q)
+    if sp is None:
+      return
+    from openpilot.sunnypilot.canlog import analyze
+    res = analyze.verdict(sp[1])
+    res["session"] = sp[0]
+    self._json(res)
+
+  def _diff(self, q: dict[str, str]) -> None:
+    sp = self._session(q)
+    if sp is None:
+      return
+    name, p = sp
     try:
       pre, post = (max(0.0, min(60.0, float(q.get(k, 3)))) for k in ("pre", "post"))
       settle = max(0.0, min(600.0, float(q.get("settle", 2))))
@@ -414,7 +438,7 @@ class Handler(BaseHTTPRequestHandler):
       from openpilot.sunnypilot.canlog.decode import decode as dec
     except Exception:
       def dec(a: int, d: bytes) -> dict: return {}
-    self._json({"session": name, "pre": pre, "post": post, "results": results, "names": {"0x%X" % k: v for k, v in w.items()},
+    self._json({"session": name, "pre": pre, "post": post, "results": results, "names": {_fa(k): v for k, v in w.items()},
                 "watched": watched_summary(frames, markers, w, dec, post_ns=int(post * 1e9)),
                 "states": res["states"][:30], "steps": res["steps"][:30], "profile": res["profile"].summary()})
 
@@ -515,6 +539,8 @@ def serve(rec: Any, port: int = 8080) -> WebServer:
   return WebServer(rec, port)
 
 
+
+
 # ---------------------------------------------------------------- page
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -534,6 +560,7 @@ header{display:flex;align-items:center;gap:10px;padding:12px 16px;position:stick
 header h1{font-size:20px;margin:0;flex:1}
 .pill{padding:4px 12px;border-radius:99px;font-weight:700;font-size:13px;background:#3a3a3f;color:#ccc}
 .pill.rec{background:var(--red);color:#fff;animation:pulse 1.2s infinite}
+.pill.on{background:var(--grn);color:#fff}.pill.off{background:#4a4a52;color:#fff}
 @keyframes pulse{50%{opacity:.45}}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--red);margin-right:4px}
 .dot.on{background:#3ddc84}
@@ -548,6 +575,7 @@ button.big{width:100%;height:72px;font-size:22px;letter-spacing:.5px;background:
 button.big.stop{background:var(--red)}
 button.sm{min-height:44px;padding:0 12px;font-size:14px}
 button.dng{background:#5a2420}
+button.blu{background:var(--blu);color:#fff}
 input,select{width:100%;min-height:56px;border-radius:12px;border:1px solid var(--line);background:#0c0c0d;padding:0 12px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .grid button{height:64px}
@@ -564,8 +592,9 @@ h2{font-size:16px;margin:14px 0 8px}h3{font-size:15px;margin:0 0 6px}
 .age{color:var(--mut);font-size:13px}.age.stale{color:var(--red)}
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;border-top:1px solid var(--line);text-align:left;vertical-align:top}
 .badge{font-size:11px;border-radius:6px;padding:1px 6px;font-weight:700}.badge.new{background:var(--grn)}.badge.gone{background:var(--red)}
+.badge.rec{background:var(--blu);color:#fff;margin-left:6px;vertical-align:middle}
 .w{font-weight:800;color:var(--blu)}
-.toast{position:fixed;left:16px;right:16px;bottom:calc(84px + env(safe-area-inset-bottom));background:#333;border-radius:12px;padding:14px;text-align:center;z-index:20;display:none}
+.toast{position:fixed;left:16px;right:16px;bottom:calc(84px + env(safe-area-inset-bottom));background:#333;border-radius:12px;padding:14px;text-align:center;z-index:60;display:none}
 nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:#161618;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);z-index:10}
 nav button{flex:1;border-radius:0;background:none;color:var(--mut);min-height:60px}
 nav button.on{color:#fff;box-shadow:inset 0 3px var(--blu)}
@@ -576,6 +605,34 @@ body:not([data-auth=ok]) #auth{display:block}
 a{color:var(--blu)}a.btn{display:inline-flex;align-items:center;min-height:44px;padding:0 12px;background:#2d2d33;border-radius:12px;color:var(--fg);text-decoration:none;font-size:14px;font-weight:600}
 footer{color:var(--mut);font-size:12px;padding:10px 0}
 .err{color:#ff7b72;min-height:20px}
+.tcard h3{font-size:19px}.tcard p{margin:4px 0 12px;color:#c8c8cf}
+.tcard button{width:100%;height:64px;font-size:20px;background:var(--blu);color:#fff}
+.chk{display:flex;align-items:center;gap:14px;padding:14px 4px;border-top:1px solid var(--line);font-size:19px;line-height:1.25}
+.chk input{width:34px;height:34px;min-height:0;flex:0 0 34px;accent-color:var(--grn)}
+details.card>summary{font-weight:700;font-size:16px;cursor:pointer;min-height:32px}
+details.sub{margin:8px 0}details.sub>summary{cursor:pointer;color:var(--blu);font-size:14px;min-height:32px}
+.box{border-radius:12px;padding:14px;margin:0 0 12px}.box.bad{background:#3a1a18;border:1px solid var(--red)}
+.box ul{margin:6px 0 0;padding-left:20px}
+.ov{position:fixed;inset:0;z-index:40;background:var(--bg);display:none;flex-direction:column;padding:calc(10px + env(safe-area-inset-top)) 16px calc(12px + env(safe-area-inset-bottom));overflow:auto}
+.ov.on{display:flex}
+.ovtop{display:flex;align-items:center;gap:10px;justify-content:space-between}
+.prog{height:6px;background:#2a2a2e;border-radius:3px;margin:8px 0 6px;overflow:hidden}.prog>div{height:100%;width:0;background:var(--blu)}
+.mid{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;gap:14px;padding:10px 0}
+#rText{font-size:32px;font-weight:800;line-height:1.2}
+#rHint{font-size:17px;color:var(--mut)}
+.ring{position:relative;width:220px;height:220px}.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ring circle{fill:none;stroke-width:14}.ring .bg{stroke:#2a2a2e}.ring .fg{stroke:var(--blu);stroke-linecap:round;stroke-dasharray:565.5;stroke-dashoffset:0}
+#rNum{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:76px;font-weight:800;font-variant-numeric:tabular-nums}
+#rClock{font-size:64px;font-weight:800;font-variant-numeric:tabular-nums}
+#rBtns{display:flex;flex-direction:column;gap:10px}
+button.giant{width:100%;min-height:120px;font-size:30px;font-weight:800;line-height:1.15;background:var(--grn);color:#fff;border:3px solid #fff;padding:10px 12px}
+button.giant.alt{min-height:72px;font-size:22px;background:#3a3a40;border-color:#666}
+.ovsec{display:flex;gap:8px;margin-top:12px}.ovsec button{flex:1}
+#rBan{background:var(--red);color:#fff;border-radius:10px;padding:10px;font-weight:700;margin:8px 0 0;display:none}
+#rPause{position:absolute;inset:0;background:rgba(17,17,17,.88);display:none;align-items:center;justify-content:center;font-size:40px;font-weight:800;pointer-events:none}
+.vline{border-radius:12px;padding:14px;margin:0 0 10px;font-size:19px;font-weight:700;line-height:1.3;border-left:10px solid}
+.vline.green{background:#173a25;border-color:var(--grn)}.vline.yellow{background:#3b3114;border-color:var(--amb)}.vline.red{background:#3a1a18;border-color:var(--red)}
+.vline small{display:block;font-weight:400;font-size:14px;color:#cfcfd6;margin-top:4px}
 </style></head>
 <body data-auth="__STATE__">
 <div id="auth"><h1 id="atitle">__TITLE__</h1>
@@ -589,14 +646,39 @@ footer{color:var(--mut);font-size:12px;padding:10px 0}
 <p class="hint">Forgot PIN? Delete /data/canlogs/pin.json over SSH.</p></div>
 <header><h1>CAN Log</h1><span class="pill" id="pill">IDLE</span><span class="can"><span class="dot" id="cdot"></span><span id="ctxt">no CAN</span></span></header>
 <main>
-<section id="t-log" class="on">
- <button class="big" id="rec">START LOGGING</button>
- <div class="stats" id="stats"></div>
- <h2>Markers</h2>
- <div class="grid" id="mgrid"></div>
- <div class="row" style="margin-top:10px"><input id="mtxt" maxlength="200" placeholder="Custom marker text"><button id="madd">Add marker</button></div>
- <div class="hint" id="mhint"></div>
- <div class="card" style="margin-top:10px"><h3>This session</h3><div id="mlist" class="hint">No markers yet</div></div>
+<section id="t-test" class="on">
+ <div id="tHome">
+  <div class="card tcard"><h3>A. Climate buttons in the car <span class="badge rec">Recommended</span></h3>
+   <p>Press Climate ON/OFF and Temp up/down in the car when told. About 15 minutes.</p><button data-start="A">Start</button></div>
+  <div class="card tcard"><h3>B. Remote start from the VW app</h3>
+   <p>Car asleep. Send a remote climate START and STOP from the app. About 6 minutes.</p><button data-start="B">Start</button></div>
+  <div class="card tcard"><h3>C. Wake-up only (key fob)</h3>
+   <p>Car asleep. Unlock with the fob and watch what wakes up. About 2 minutes.</p><button data-start="C">Start</button></div>
+  <details class="card" id="manual"><summary>Manual mode</summary>
+   <div style="height:10px"></div>
+   <button class="big" id="rec">START LOGGING</button>
+   <div class="stats" id="stats"></div>
+   <h2>Markers</h2>
+   <div class="grid" id="mgrid"></div>
+   <div class="row" style="margin-top:10px"><input id="mtxt" maxlength="200" placeholder="Custom marker text"><button id="madd">Add marker</button></div>
+   <div class="hint" id="mhint"></div>
+   <div class="card" style="margin-top:10px"><h3>This session</h3><div id="mlist" class="hint">No markers yet</div></div>
+  </details>
+ </div>
+ <div id="tPre" style="display:none">
+  <h2 id="pTitle" style="font-size:22px"></h2>
+  <div class="hint">Tick every box to continue.</div>
+  <div class="card" id="pList"></div>
+  <div class="box bad" id="pErr" style="display:none"></div>
+  <button class="giant" id="pGo" disabled>START TEST</button>
+  <div style="height:10px"></div>
+  <button class="sm" id="pBack" style="width:100%">Back</button>
+ </div>
+ <div id="tVerdict" style="display:none">
+  <h2 id="vTitle" style="font-size:22px">Test result</h2>
+  <div class="spin" id="vSpin"></div>
+  <div id="vOut"></div>
+ </div>
 </section>
 <section id="t-live"><div id="live"><div class="hint">Waiting for data...</div></div></section>
 <section id="t-res">
@@ -610,14 +692,28 @@ footer{color:var(--mut);font-size:12px;padding:10px 0}
 <section id="t-files"><div class="hint">Downloads open in a new tab (Safari); use Share from there.</div><div id="files"></div></section>
 <footer><div id="addrs"></div><div>Forgot PIN? Delete /data/canlogs/pin.json over SSH.</div><button class="sm" id="lock" style="margin-top:8px">Lock</button></footer>
 </main>
+<div class="ov" id="run">
+ <div class="ovtop"><span class="pill" id="rPill">Climate status: -</span><span class="age" id="rStep"></span></div>
+ <div class="prog"><div id="rProg"></div></div>
+ <div id="rBan"></div>
+ <div class="mid">
+  <div id="rText"></div>
+  <div class="ring" id="rRing"><svg viewBox="0 0 200 200"><circle class="bg" cx="100" cy="100" r="90"/><circle class="fg" id="rArc" cx="100" cy="100" r="90"/></svg><div id="rNum"></div></div>
+  <div id="rClock"></div>
+  <div id="rHint"></div>
+ </div>
+ <div id="rBtns"></div>
+ <div class="ovsec"><button class="sm" id="rUndo">Undo last marker</button><button class="sm" id="rPauseBtn">Pause</button><button class="sm dng" id="rAbort">Abort test</button></div>
+ <div id="rPause">PAUSED</div>
+</div>
 <div class="toast" id="toast"></div>
-<nav id="nav"><button data-t="log" class="on">Log</button><button data-t="live">Live</button><button data-t="res">Results</button><button data-t="files">Files</button></nav>
+<nav id="nav"><button data-t="test" class="on">Test</button><button data-t="live">Live</button><button data-t="res">Results</button><button data-t="files">Files</button></nav>
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let st={}, names={}, tab="log", prevLive={}, flashT={}, timers=[], authState=document.body.dataset.auth;
-function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display="none",2200)}
+let st={}, names={}, tab="test", prevLive={}, flashT={}, timers=[], authState=document.body.dataset.auth;
+function toast(m,ms){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display="none",ms||2200)}
 async function api(p,o){
   const r=await fetch(p,Object.assign({credentials:"same-origin",headers:{"Content-Type":"application/json"}},o||{}));
   if(r.status===401&&p!=="/api/login"){setAuth("login");throw new Error("auth")}
@@ -642,10 +738,12 @@ $("abtn").onclick=async()=>{
   }catch(e){$("aerr").textContent=e.message+(e.status===429?" - try again in a minute":"")}};
 $("pin").onkeydown=$("pin2").onkeydown=e=>{if(e.key==="Enter")$("abtn").click()};
 $("lock").onclick=async()=>{try{await post("/api/logout")}catch(e){}setAuth("login")};
-$("nav").onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(!t)return;tab=t;
-  document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b===e.target));
+function goTab(t){tab=t;
+  document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));
   document.querySelectorAll("section").forEach(s=>s.classList.toggle("on",s.id==="t-"+t));
-  if(t==="files"||t==="res")loadSessions();if(t==="live")pollLive()};
+  if(t==="files"||t==="res")loadSessions();if(t==="live")pollLive()}
+$("nav").onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t)goTab(t)};
+// ---------------------------------------------------------------- manual mode
 const MK=["Climate ON","Climate OFF","Temp up","Temp down"];
 $("mgrid").innerHTML=MK.map(m=>`<button data-m="${esc(m)}" class="mk">${esc(m)}</button>`).join("");
 async function addMarker(text){
@@ -653,7 +751,9 @@ async function addMarker(text){
     (st._mk=st._mk||[]).push(m);renderMarkers()}catch(e){if(e.message!=="auth")toast(e.message)}}
 $("mgrid").onclick=e=>{if(e.target.dataset.m)addMarker(e.target.dataset.m)};
 $("madd").onclick=()=>{const v=$("mtxt").value.trim();if(v){addMarker(v);$("mtxt").value=""}};
-$("rec").onclick=async()=>{try{await post(st.recording?"/api/stop":"/api/start");st._mk=[];pollStatus()}catch(e){if(e.message!=="auth")toast(e.message)}};
+$("rec").onclick=async()=>{
+  if(T&&!confirm("A guided test is running. Stop logging anyway?"))return;
+  try{await post(st.recording?"/api/stop":"/api/start");st._mk=[];pollStatus()}catch(e){if(e.message!=="auth")toast(e.message)}};
 function renderMarkers(){const l=st._mk||[];
   $("mlist").innerHTML=l.length?l.map(m=>`<div>${Number(m.rel_s).toFixed(1)} s &nbsp; ${esc(m.text)}</div>`).join(""):"No markers yet"}
 function renderStatus(){
@@ -670,7 +770,8 @@ function renderStatus(){
    (s.last_error?`<br><span class="err">${esc(s.last_error)}</span>`:"");
   renderMarkers();
   $("addrs").textContent="Reach this page at: "+(s.addrs||[]).map(a=>"http://"+a+":"+location.port).join("  ")}
-async function pollStatus(){try{const m=st._mk;st=await api("/api/status");st._mk=st.recording?(m&&m.length>=(st.markers||[]).length?m:st.markers||[]):[];renderStatus()}catch(e){}}
+async function pollStatus(){try{const m=st._mk;st=await api("/api/status");st._mk=st.recording?(m&&m.length>=(st.markers||[]).length?m:st.markers||[]):[];renderStatus();resumeOnce()}catch(e){}}
+// ---------------------------------------------------------------- live tab
 function hexBytes(id,bus,hex){
   const k=id+"/"+bus,p=prevLive[k]||"",now=Date.now();let o="";
   for(let i=0;i<hex.length;i+=2){const b=hex.substr(i,2);
@@ -688,6 +789,7 @@ async function pollLive(){
         `<span class="mono">${hexBytes(id,b,String(v.data))}</span><br>`+
         Object.entries(v.decoded||{}).map(([k,x])=>`<span class="chip">${esc(k)}: ${esc(x)}</span>`).join("")+`</div>`}).join("")||`<div class="hint">no frames yet</div>`)+`</div>`}).join("")
   }catch(e){}}
+// ---------------------------------------------------------------- files / results
 let sessions=[];
 const q=s=>encodeURIComponent(s);
 async function loadSessions(){
@@ -695,12 +797,13 @@ async function loadSessions(){
   $("files").innerHTML=sessions.map(s=>{const n=q(s.name),mk=Array.isArray(s.markers)?s.markers.length:s.markers;
     return `<div class="card"><b>${esc(s.name)}</b><div class="hint">${(s.bytes/1048576).toFixed(1)} MB &middot; ${mk} markers &middot; ${new Date(s.mtime*1000).toLocaleString()}</div>`+
     `<a class="btn" target="_blank" href="/logs/${n}.canlog">Download</a> <a class="btn" target="_blank" href="/logs/${n}.canlog?gz=1">Download .gz</a> `+
-    `<button class="sm" data-diff="${esc(s.name)}">Diff</button> <button class="sm dng" data-del="${esc(s.name)}">Delete</button></div>`}).join("")||`<div class="hint">No sessions</div>`;
+    `<button class="sm blu" data-verdict="${esc(s.name)}">Verdict</button> <button class="sm" data-diff="${esc(s.name)}">Diff</button> <button class="sm dng" data-del="${esc(s.name)}">Delete</button></div>`}).join("")||`<div class="hint">No sessions</div>`;
   const cur=$("rsess").value;
   $("rsess").innerHTML=sessions.map(s=>`<option value="${esc(s.name)}">${esc(s.name)}</option>`).join("");
   if(cur&&sessions.some(s=>s.name===cur))$("rsess").value=cur}
 $("files").onclick=async e=>{const t=e.target;
-  if(t.dataset.diff){$("rsess").value=t.dataset.diff;$("nav").querySelector('[data-t=res]').click();runDiff()}
+  if(t.dataset.diff){$("rsess").value=t.dataset.diff;goTab("res");runDiff()}
+  if(t.dataset.verdict){goTab("test");showVerdict(t.dataset.verdict)}
   if(t.dataset.del&&confirm("Delete "+t.dataset.del+"?")){
     try{await api("/api/sessions/"+q(t.dataset.del),{method:"DELETE"});loadSessions()}catch(er){if(er.message!=="auth")toast(er.message)}}};
 $("rrun").onclick=runDiff;
@@ -734,9 +837,168 @@ async function runDiff(){
   }catch(e){if(e.message!=="auth")$("rout").innerHTML=`<div class="err">${esc(e.message)}</div>`}
   $("spin").style.display="none"}
 $("rout").onclick=e=>{if(e.target.classList.contains("tg")){e.preventDefault();e.target.nextSibling.style.display="inline";e.target.style.display="none"}};
-function startPolling(){stopPolling();pollStatus();timers=[setInterval(()=>{if(!document.hidden&&tab==="live")pollLive()},500),setInterval(()=>{if(!document.hidden)pollStatus()},1000)]}
+// ---------------------------------------------------------------- guided tests
+// step kinds: wait (auto-advance), act (one button + marker), ask (buttons, optional jump), confirm (button, clock, no auto-advance)
+const WAITTXT="Wait — don't touch anything";
+function buildSteps(id){
+  const S=[],W=(s,t,x)=>S.push(Object.assign({k:"wait",s,t:t||WAITTXT},x||{}));
+  const A=(t,b,m,n,x)=>S.push(Object.assign({k:"act",t,b,m,n},x||{}));
+  if(id==="A"){
+    W(60,"Baseline: don't touch anything");
+    for(let i=0;i<6;i++){A("Press CLIMATE ON in the car now","I PRESSED CLIMATE ON","Climate ON",1);W(20);A("Press CLIMATE OFF in the car now","I PRESSED CLIMATE OFF","Climate OFF",1);W(20)}
+    for(const [t,b,m] of [["UP","UP","Temp up"],["UP","UP","Temp up"],["DOWN","DOWN","Temp down"],["DOWN","DOWN","Temp down"]]){
+      A(`Press TEMPERATURE ${t} once`,`I PRESSED TEMP ${b}`,m,1);W(20)}
+    S.push({k:"ask",t:"Optional: send a remote climate START from the VW app now",bs:[{l:"I SENT IT",m:"Remote START sent"},{l:"SKIP",go:"tail"}]});
+    S.push({k:"confirm",t:"Tap when the app says it worked",b:"APP SAYS IT WORKED",m:"Remote START confirmed",cd:120});
+    W(30,"Almost done: don't touch anything",{id:"tail"});
+  }else if(id==="B"){
+    W(60,"Baseline: don't touch anything");
+    A("Open the VW app. Don't send anything.","I OPENED THE APP","App opened");W(60);
+    A("Send remote climate START now","I SENT START","Remote START sent");
+    S.push({k:"confirm",t:"Tap when the app confirms",b:"APP CONFIRMED START",m:"Remote START confirmed"});W(60);
+    A("Send remote climate STOP now","I SENT STOP","Remote STOP sent");
+    S.push({k:"confirm",t:"Tap when the app confirms",b:"APP CONFIRMED STOP",m:"Remote STOP confirmed"});W(60,"Last wait: don't touch anything");
+  }else{
+    W(30,"Baseline: don't touch anything");
+    A("Unlock the car with the key fob now","I PRESSED UNLOCK","Fob unlock");W(60);
+  }
+  return S}
+const TESTS={
+  A:{name:"A. Climate buttons in the car",alive:true,pre:["Comma plugged into the car","Car switched on","Always Offroad is ON (Settings → Device)","Phone connected to the comma"]},
+  B:{name:"B. Remote start from the VW app",alive:false,pre:["Car locked and asleep (untouched for 5+ minutes)","Phone connected to the comma","Max Time Offroad is 0"]},
+  C:{name:"C. Wake-up only (key fob)",alive:false,pre:["Car locked and asleep (untouched for 5+ minutes)","Phone connected to the comma","Max Time Offroad is 0"]}};
+const LSK="canlog_test_v1";
+let T=null, STEPS=[], busy=false, pendingId=null, AC=null, WL=null, resumed=false, liveBusy=false;
+function save(){try{if(T)localStorage.setItem(LSK,JSON.stringify(T));else localStorage.removeItem(LSK)}catch(e){}}
+function loadT(){try{return JSON.parse(localStorage.getItem(LSK)||"null")}catch(e){return null}}
+function prime(){try{AC=AC||new (window.AudioContext||window.webkitAudioContext)();if(AC.state==="suspended")AC.resume()}catch(e){}}
+document.addEventListener("pointerdown",prime,{passive:true});
+function beep(n){try{prime();for(let i=0;i<(n||1);i++){const o=AC.createOscillator(),g=AC.createGain(),t0=AC.currentTime+i*.3;
+  o.frequency.value=880;g.gain.value=.3;o.connect(g);g.connect(AC.destination);o.start(t0);o.stop(t0+.2)}}catch(e){}
+  try{navigator.vibrate&&navigator.vibrate(150)}catch(e){}}
+async function wake(){try{if(T&&navigator.wakeLock&&!WL){WL=await navigator.wakeLock.request("screen");WL.addEventListener("release",()=>{WL=null})}}catch(e){WL=null}}
+function unwake(){try{WL&&WL.release()}catch(e){}WL=null}
+const fmt=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")};
+function showHome(){$("tHome").style.display="";$("tPre").style.display="none";$("tVerdict").style.display="none"}
+document.querySelectorAll("[data-start]").forEach(b=>b.onclick=()=>showPre(b.dataset.start));
+function showPre(id){
+  pendingId=id;const t=TESTS[id];$("pTitle").textContent=t.name;$("pErr").style.display="none";
+  $("pList").innerHTML=t.pre.map((x,i)=>`<label class="chk"><input type="checkbox" data-c="${i}"><span>${esc(x)}</span></label>`).join("");
+  $("pGo").disabled=true;$("tHome").style.display="none";$("tVerdict").style.display="none";$("tPre").style.display="";window.scrollTo(0,0)}
+$("pList").onchange=()=>{$("pGo").disabled=!Array.from($("pList").querySelectorAll("input")).every(c=>c.checked)};
+$("pBack").onclick=showHome;
+function startError(title,items){$("pErr").innerHTML=`<b>${esc(title)}</b><ul>${items.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>`;$("pErr").style.display="block";$("pErr").scrollIntoView()}
+$("pGo").onclick=()=>beginTest(pendingId);
+async function beginTest(id){
+  prime();$("pErr").style.display="none";const t=TESTS[id];let s;
+  try{s=await api("/api/status")}catch(e){if(e.message!=="auth")startError("Cannot reach the comma",["Is your phone still connected to the comma's Wi-Fi / hotspot?","Reload this page and try again."]);return}
+  if(!s.can_alive){
+    if(t.alive)return startError("No CAN data from the car",["Is the comma plugged into the car (OBD / harness)?","Is the car switched on (ignition / READY)?","Is Always Offroad ON (Settings → Device)? Otherwise the comma may be asleep or off.","Wait a few seconds and try again."]);
+    if(!confirm("No CAN data right now. That is normal if the car is asleep. Start logging anyway?"))return}
+  if(s.recording){if(!confirm("A recording is already running. Stop it and start this test?"))return;try{await post("/api/stop")}catch(e){}}
+  let r;
+  try{r=await post("/api/start")}catch(e){if(e.message!=="auth")startError("Could not start logging: "+e.message,["Is there free space on the comma? (see Manual mode)","Check the comma is awake and the canlog service is running."]);return}
+  T={id,session:r.session,idx:0,cnt:{},last:null,dl:0,t0:0,pat:0};
+  STEPS=buildSteps(id);enterStep(0);$("run").classList.add("on");wake();showHome();pollStatus()}
+function enterStep(i){
+  const s=STEPS[i],now=Date.now();T.idx=i;T.t0=now;T.pat=0;T.dl=now+((s.s||s.cd||0)*1000);save();showStep()}
+function nextStep(go){
+  let i=T.idx+1;
+  if(go){const j=STEPS.findIndex(x=>x.id===go);if(j>=0)i=j}
+  if(i>=STEPS.length)return finishTest(false);
+  enterStep(i)}
+function showStep(){
+  const s=STEPS[T.idx],n=STEPS.length;
+  $("rStep").textContent=`Step ${T.idx+1} of ${n}`;$("rProg").style.width=(T.idx/n*100)+"%";
+  $("rText").textContent=s.t;
+  $("rRing").style.display=s.k==="wait"?"block":"none";
+  $("rClock").style.display=s.k==="confirm"?"block":"none";
+  $("rHint").textContent=s.k==="wait"?"Logging is running":(s.k==="confirm"?(s.cd?"Time left to get the answer":"Time since you sent it"):"");
+  let h="";
+  if(s.k==="act")h=`<button class="giant" data-a="0">${esc(s.b)}</button>`;
+  else if(s.k==="confirm")h=`<button class="giant" data-a="0">${esc(s.b)}</button>`;
+  else if(s.k==="ask")h=s.bs.map((b,i)=>`<button class="giant${i?" alt":""}" data-a="${i}">${esc(b.l)}</button>`).join("");
+  $("rBtns").innerHTML=h;
+  $("rUndo").disabled=!T.last;$("rPauseBtn").textContent=T.pat?"Resume":"Pause";
+  tick()}
+async function mark(m,numbered){
+  let text=m;
+  if(numbered){T.cnt[m]=(T.cnt[m]||0)+1;text=m+" #"+T.cnt[m]}
+  try{await post("/api/marker",{text});T.last={idx:T.idx,base:numbered?m:null};save();return true}
+  catch(e){if(numbered)T.cnt[m]--;if(e.message!=="auth")toast("Marker NOT saved: "+e.message+". Is logging running?",4000);return false}}
+$("rBtns").onclick=async e=>{
+  const b=e.target.closest("button[data-a]");if(!b||!T||busy||T.pat)return;
+  const s=STEPS[T.idx],a=s.k==="ask"?s.bs[+b.dataset.a]:s;busy=true;
+  try{if(a.m&&!await mark(a.m,a.n))return;nextStep(a.go)}finally{busy=false}};
+$("rUndo").onclick=async()=>{
+  if(!T||!T.last||busy)return;busy=true;
+  try{await post("/api/marker",{text:"UNDO previous"});const l=T.last;if(l.base)T.cnt[l.base]--;T.last=null;toast("Last marker undone");enterStep(l.idx)}
+  catch(er){if(er.message!=="auth")toast("Undo failed: "+er.message)}finally{busy=false}};
+$("rPauseBtn").onclick=()=>{
+  if(!T)return;const now=Date.now();
+  if(T.pat){const d=now-T.pat;T.dl+=d;T.t0+=d;T.pat=0}else T.pat=now;
+  save();$("rPauseBtn").textContent=T.pat?"Resume":"Pause";tick()};
+$("rAbort").onclick=()=>{if(T&&confirm("Abort the test? Logging stops and the file is kept."))finishTest(true)};
+async function finishTest(abort){
+  const sess=T.session;
+  try{await post("/api/stop")}catch(e){if(e.message!=="auth")toast("Could not stop logging: "+e.message,4000)}
+  T=null;STEPS=[];save();unwake();$("run").classList.remove("on");pollStatus();goTab("test");
+  if(abort){showHome();toast("Test aborted. Log kept: "+sess,4000)}
+  else{beep(3);showVerdict(sess)}}
+function ringSet(frac){$("rArc").style.strokeDashoffset=String(565.5*(1-Math.max(0,Math.min(1,frac))))}
+function tick(){
+  if(!T||!STEPS.length)return;
+  const s=STEPS[T.idx],now=Date.now(),ref=T.pat||now;
+  if(!T.pat&&s.k==="wait"&&now>=T.dl&&!busy){beep(1);nextStep();return}
+  if(s.k==="wait"){const r=Math.max(0,T.dl-ref);$("rNum").textContent=Math.ceil(r/1000);ringSet(r/(s.s*1000))}
+  else if(s.k==="confirm"){const c=s.cd?(T.dl-ref)/1000:(ref-T.t0)/1000;
+    $("rClock").textContent=(c<0?"+":"")+fmt(Math.abs(c))}
+  $("rPause").style.display=T.pat?"flex":"none";
+  const ban=$("rBan"),bad=st&&st.recording===false?"Logging is NOT running! Abort the test and start again.":(st&&st.can_alive===false&&TESTS[T.id].alive?"No CAN data right now. Check the comma is still connected to the car.":"");
+  ban.style.display=bad?"block":"none";ban.textContent=bad}
+setInterval(tick,250);
+function climatePill(d){
+  const p=$("rPill");let best=null;
+  const k=Object.keys(d).find(k=>k.startsWith("0x")&&parseInt(k,16)===0x3B5);
+  if(k){const bs=d[k];const b=bs["1"]||bs[Object.keys(bs).sort((x,y)=>bs[x].age_s-bs[y].age_s)[0]];if(b&&b.age_s<3&&b.decoded&&typeof b.decoded.climate_on_candidate==="boolean")best=b.decoded.climate_on_candidate}
+  p.textContent="Climate status: "+(best===null?"-":best?"ON":"OFF")+" (candidate)";
+  p.className="pill"+(best===null?"":best?" on":" off")}
+async function pollTestLive(){if(!T||liveBusy||document.hidden)return;liveBusy=true;try{climatePill(await api("/api/live"))}catch(e){}liveBusy=false}
+function resumeOnce(){
+  if(resumed||authState!=="ok")return;resumed=true;const x=loadT();if(!x||!TESTS[x.id])return;
+  if(!st.recording||st.session!==x.session){try{localStorage.removeItem(LSK)}catch(e){}
+    toast("The test ended while this page was closed. Showing its result.",4000);showVerdict(x.session);return}
+  T=x;STEPS=buildSteps(T.id);if(T.idx>=STEPS.length){finishTest(false);return}
+  $("run").classList.add("on");showStep();wake()}
+// ---------------------------------------------------------------- verdict
+const LV={green:"LOOKS RIGHT",yellow:"MAYBE",red:"NO"};
+async function showVerdict(sess){
+  $("tHome").style.display="none";$("tPre").style.display="none";$("tVerdict").style.display="";
+  $("vOut").innerHTML="";$("vSpin").style.display="block";$("vTitle").textContent="Analysing "+sess+" ...";window.scrollTo(0,0);
+  let v;
+  try{v=await api("/api/verdict?session="+q(sess))}
+  catch(e){$("vSpin").style.display="none";$("vTitle").textContent="Test result";if(e.message!=="auth")$("vOut").innerHTML=`<div class="box bad">Could not analyse: ${esc(e.message)}</div><button class="sm" id="vDone" style="width:100%">Done</button>`;bindDone();return}
+  $("vSpin").style.display="none";$("vTitle").textContent="Test result";
+  const ev=c=>c.events.length?`<table><tr><th>Marker</th><th>at</th><th>Result</th><th>Changed after</th></tr>`+c.events.map(e=>
+    `<tr><td>${esc(e.text)}</td><td>${e.rel_s} s</td><td>${e.ok===null?esc(e.note):(e.ok?"yes":"no")+(e.note?" ("+esc(e.note)+")":"")}</td><td>${e.flip_s===null?"-":e.flip_s+" s"}</td></tr>`).join("")+`</table>`:`<div class="hint">No matching markers.</div>`;
+  let h=v.candidates.map(c=>`<div class="vline ${c.level}"><span class="badge" style="background:#0006">${LV[c.level]}</span> ${esc(c.summary)}</div>`+
+    `<details class="sub"><summary>Details: ${esc(c.label)} (${esc(c.addr_hex)}, bus ${c.bus}, ${c.frames} frames)</summary>${ev(c)}</details>`).join("");
+  const bs=Object.keys(v.buses||{});
+  h+=`<div class="card"><h3>What was recorded</h3><div>${v.markers} markers, ${v.log_seconds} s of log</div>`+
+    (bs.length?bs.map(b=>`<div class="hint">Bus ${b}: ${v.buses[b].frames} frames, ${v.buses[b].ids} different ids</div>`).join(""):`<div class="err">No CAN frames in this log at all.</div>`)+
+    (v.notes||[]).map(n=>`<div class="hint">${esc(n)}</div>`).join("")+`</div>`;
+  const sc=(v.states||[]).map(c=>`<tr><td>bus ${c.bus}</td><td class="mono">${esc(c.addr_hex)}${c.mux?" mux "+esc(c.mux):""} b${c.i}</td><td class="mono">ON ${esc(c.on_vals.join(","))} / OFF ${esc(c.off_vals.join(","))}</td></tr>`).join("");
+  const tc=(v.steps||[]).map(c=>`<tr><td>bus ${c.bus}</td><td class="mono">${esc(c.addr_hex)}${c.mux?" mux "+esc(c.mux):""} b${c.i}</td><td class="mono">${c.matched}/${c.steps} ${c.inverted?"inverted":""}</td></tr>`).join("");
+  h+=`<details class="sub"><summary>Details: other bytes that follow the buttons</summary><div class="hint">Climate ON/OFF</div>${sc?`<table>${sc}</table>`:`<div class="hint">None found.</div>`}<div class="hint">Temp up/down</div>${tc?`<table>${tc}</table>`:`<div class="hint">None found.</div>`}</details>`;
+  h+=`<div class="row" style="margin:12px 0"><a class="btn" style="min-height:56px" target="_blank" href="/logs/${q(v.session)}.canlog?gz=1">Download log (.gz)</a><button id="vDiff">Run diff</button></div>`+
+    `<button class="giant alt" id="vDone">DONE</button>`;
+  $("vOut").innerHTML=h;bindDone();
+  $("vDiff").onclick=async()=>{goTab("res");await loadSessions();$("rsess").value=v.session;runDiff()}}
+function bindDone(){const b=$("vDone");if(b)b.onclick=showHome}
+// ---------------------------------------------------------------- polling
+function startPolling(){stopPolling();pollStatus();timers=[setInterval(()=>{if(!document.hidden&&tab==="live")pollLive()},500),setInterval(()=>{if(!document.hidden){pollStatus();pollTestLive()}},1000)]}
 function stopPolling(){timers.forEach(clearInterval);timers=[]}
-document.addEventListener("visibilitychange",()=>{if(!document.hidden&&authState==="ok"){pollStatus();if(tab==="live")pollLive()}});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&authState==="ok"){pollStatus();if(tab==="live")pollLive();if(T){wake();tick()}}});
 setAuth(authState);
 </script></body></html>
 """
